@@ -32,8 +32,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   New endpoints: `POST /api/backup-orchestrator/drill` (admin, async — returns
   202 immediately, drill row updates as the agent finishes) and
   `GET /api/backup-orchestrator/drills` (paginated history). Agent endpoint
-  `POST /backups/drill/site`. Database and volume drill engines come in
-  W1.2.b/c — non-site rows show `—` for now with a tooltip explaining.
+  `POST /backups/drill/site`.
+- **End-to-end DB drills for postgres + mysql/mariadb** (Phase 4 W1.2 part B).
+  Click `Drill` on any database row in the All Backups tab — the agent boots
+  a scratch engine container (`postgres:16-alpine` or `mariadb:11`,
+  `--network none`, 256MB / 1 CPU caps), pipes `zcat` of the dump into a
+  direct-fd `psql`/`mariadb` restore, runs `ANALYZE` (postgres) to populate
+  planner stats, then sums table count and row totals from
+  `pg_class.reltuples` / `information_schema.tables.table_rows`. Drill body
+  records `"N tables, ~M rows restored"` — strictly stronger than verify,
+  which only confirms the dump applies. Pass requires tables > 0; row
+  total is reported but doesn't gate (legitimate schema-only dumps pass).
+  Backend `POST /api/backup-orchestrator/drill` now accepts
+  `backup_type = "database"` and dispatches to new agent route
+  `POST /backups/drill/db`. Drills tab "HTTP" column renamed to "Result"
+  and renders the row/table summary for DB drills. Volume drill is W1.2.c.
 
 ## [2.7.20] - 2026-04-28
 

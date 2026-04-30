@@ -1184,23 +1184,23 @@ pub async fn list_verifications(
 
 #[derive(serde::Deserialize)]
 pub struct DrillRequest {
-    pub backup_type: String, // site (only kind supported in W1.2; db/volume come later)
+    pub backup_type: String, // site | database (volume drill is W1.2.c)
     pub backup_id: Uuid,
 }
 
 /// POST /api/backup-orchestrator/drill — Trigger an on-demand backup drill.
-/// Currently supports `backup_type = "site"`; database and volume drills are
-/// W1.2.b / W1.2.c and will land in subsequent sessions.
+/// Supports `backup_type = "site"` (W1.2.a) and `"database"` (W1.2.b).
+/// Volume drills land in W1.2.c.
 pub async fn trigger_drill(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
     Json(req): Json<DrillRequest>,
 ) -> Result<(StatusCode, Json<BackupDrill>), ApiError> {
-    if req.backup_type != "site" {
+    if req.backup_type != "site" && req.backup_type != "database" {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "Only site drills are implemented in this version (db + volume drills coming soon)",
+            "Only site and database drills are implemented in this version (volume drill coming soon)",
         ));
     }
 
@@ -1215,25 +1215,53 @@ pub async fn trigger_drill(
 
     let drill_id = drill.id;
     let db = state.db.clone();
+    let backup_type = req.backup_type.clone();
     let backup_id = req.backup_id;
 
-    // Run drill async — the agent call can take 20-30s (extract + nginx start + probe).
+    // Run drill async — the agent call can take 20-60s (DB drill is slower:
+    // engine container boot + full restore + ANALYZE).
     tokio::spawn(async move {
-        let row = sqlx::query_as::<_, (String, String)>(
-            "SELECT s.domain, b.filename FROM backups b \
-             JOIN sites s ON s.id = b.site_id WHERE b.id = $1"
-        ).bind(backup_id).fetch_optional(&db).await;
+        let result: Result<serde_json::Value, String> = match backup_type.as_str() {
+            "site" => {
+                let row = sqlx::query_as::<_, (String, String)>(
+                    "SELECT s.domain, b.filename FROM backups b \
+                     JOIN sites s ON s.id = b.site_id WHERE b.id = $1"
+                ).bind(backup_id).fetch_optional(&db).await;
 
-        let result: Result<serde_json::Value, String> = match row {
-            Ok(Some((domain, filename))) => {
-                let body = serde_json::json!({ "domain": domain, "filename": filename });
-                agent.post("/backups/drill/site", Some(body)).await.map_err(|e| e.to_string())
+                match row {
+                    Ok(Some((domain, filename))) => {
+                        let body = serde_json::json!({ "domain": domain, "filename": filename });
+                        agent.post("/backups/drill/site", Some(body)).await.map_err(|e| e.to_string())
+                    }
+                    Ok(None) => Err("Site backup not found".to_string()),
+                    Err(e) => {
+                        tracing::warn!("DB error fetching site backup for drill: {e}");
+                        Err(format!("Database error: {e}"))
+                    }
+                }
             }
-            Ok(None) => Err("Site backup not found".to_string()),
-            Err(e) => {
-                tracing::warn!("DB error fetching site backup for drill: {e}");
-                Err(format!("Database error: {e}"))
+            "database" => {
+                let row = sqlx::query_as::<_, (String, String, String)>(
+                    "SELECT db_type, db_name, filename FROM database_backups WHERE id = $1"
+                ).bind(backup_id).fetch_optional(&db).await;
+
+                match row {
+                    Ok(Some((db_type, db_name, filename))) => {
+                        let body = serde_json::json!({
+                            "db_type": db_type,
+                            "db_name": db_name,
+                            "filename": filename,
+                        });
+                        agent.post("/backups/drill/db", Some(body)).await.map_err(|e| e.to_string())
+                    }
+                    Ok(None) => Err("Database backup not found".to_string()),
+                    Err(e) => {
+                        tracing::warn!("DB error fetching database backup for drill: {e}");
+                        Err(format!("Database error: {e}"))
+                    }
+                }
             }
+            _ => Err("Unsupported backup type".to_string()),
         };
 
         match result {

@@ -35,7 +35,30 @@ async fn drill_site(
     Ok(Json(result))
 }
 
+#[derive(serde::Deserialize)]
+pub struct DrillDbRequest {
+    pub db_type: String,
+    pub db_name: String,
+    pub filename: String,
+}
+
+/// POST /backups/drill/db — DB drill: scratch engine container + full restore + row probe.
+async fn drill_db(
+    Json(req): Json<DrillDbRequest>,
+) -> Result<Json<backup_drill::DrillResult>, ApiErr> {
+    // db_type whitelist mirrors the engines we know how to spin.
+    match req.db_type.as_str() {
+        "mysql" | "mariadb" | "postgres" | "postgresql" => {}
+        _ => return Err(err(StatusCode::BAD_REQUEST, "Unsupported db_type")),
+    }
+    let result = backup_drill::drill_db_backup(&req.db_type, &req.db_name, &req.filename)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(result))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/backups/drill/site", post(drill_site))
+        .route("/backups/drill/db", post(drill_db))
 }

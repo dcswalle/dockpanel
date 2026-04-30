@@ -284,12 +284,16 @@ export default function BackupOrchestrator() {
     }
   };
 
-  const triggerDrill = async (backupId: string) => {
+  const triggerDrill = async (backupId: string, backupType: "site" | "database") => {
     try {
-      await api.post("/backup-orchestrator/drill", { backup_type: "site", backup_id: backupId });
-      setMessage({ text: "Drill started — restoring into a scratch container, this can take 30s", type: "success" });
+      await api.post("/backup-orchestrator/drill", { backup_type: backupType, backup_id: backupId });
+      const msg = backupType === "site"
+        ? "Site drill started — restoring into a scratch container, this can take 30s"
+        : "Database drill started — booting scratch engine + restoring + counting rows, this can take 60s";
+      setMessage({ text: msg, type: "success" });
       setTimeout(loadAll, 8000);
       setTimeout(loadAll, 30000);
+      setTimeout(loadAll, 75000);
     } catch (e) {
       setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" });
     }
@@ -578,7 +582,7 @@ function AllBackupsTab({
   setFilterServer: (s: string) => void;
   setFilterKind: (k: "" | "site" | "database" | "volume") => void;
   onPage: (offset: number) => void;
-  onDrill: (backupId: string) => void;
+  onDrill: (backupId: string, backupType: "site" | "database") => void;
 }) {
   const hasNext = offset + data.items.length < data.total;
   const hasPrev = offset > 0;
@@ -682,17 +686,19 @@ function AllBackupsTab({
                       <div className="text-[10px] text-dark-300">{timeAgo(row.created_at)}</div>
                     </td>
                     <td className="px-4 py-2 text-right">
-                      {row.kind === "site" ? (
+                      {row.kind === "site" || row.kind === "database" ? (
                         <button
                           type="button"
-                          onClick={() => onDrill(row.id)}
+                          onClick={() => onDrill(row.id, row.kind as "site" | "database")}
                           className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
-                          title="Restore into a scratch container and probe HTTP — proves the backup is actually deployable"
+                          title={row.kind === "site"
+                            ? "Restore into a scratch nginx and probe HTTP — proves the backup is actually deployable"
+                            : "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"}
                         >
                           Drill
                         </button>
                       ) : (
-                        <span className="text-[10px] text-dark-400 font-mono" title="Drill engine for database/volume backups ships in a later release">—</span>
+                        <span className="text-[10px] text-dark-400 font-mono" title="Volume drill engine ships in a later release">—</span>
                       )}
                     </td>
                   </tr>
@@ -1014,17 +1020,25 @@ function VerificationsTab({ verifications }: { verifications: Verification[] }) 
 // ── Drills Tab (Phase 4 W1.2: end-to-end restore probes) ──────────────────
 
 function DrillsTab({ drills }: { drills: Drill[] }) {
+  const resultCell = (d: Drill) => {
+    if (d.backup_type === "site") {
+      return d.http_status != null ? `HTTP ${d.http_status}` : "—";
+    }
+    // database: body_excerpt holds the row/table summary
+    return d.body_excerpt ?? "—";
+  };
+
   return drills.length === 0 ? (
     <div className="p-12 text-center">
       <p className="text-dark-200 text-sm font-mono">No drills yet</p>
-      <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any site backup in the All Backups tab to do a real end-to-end restore probe.</p>
+      <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any site or database backup in the All Backups tab to do a real end-to-end restore probe.</p>
     </div>
   ) : (
     <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">
       <table className="w-full">
         <thead>
           <tr className="bg-dark-900 border-b border-dark-500">
-            {["Type", "Status", "HTTP", "Duration", "Error", "Created"].map(h => (
+            {["Type", "Status", "Result", "Duration", "Error", "Created"].map(h => (
               <th key={h} className="text-left text-xs font-medium text-dark-200 uppercase font-mono tracking-widest px-5 py-3">{h}</th>
             ))}
           </tr>
@@ -1041,7 +1055,7 @@ function DrillsTab({ drills }: { drills: Drill[] }) {
                   : "bg-dark-700 text-dark-200"
                 }`}>{d.status}</span>
               </td>
-              <td className="px-5 py-4 text-sm text-dark-200 font-mono">{d.http_status ?? "—"}</td>
+              <td className="px-5 py-4 text-sm text-dark-200 font-mono truncate max-w-[200px]" title={d.body_excerpt ?? ""}>{resultCell(d)}</td>
               <td className="px-5 py-4 text-sm text-dark-200 font-mono">{d.duration_ms ? `${(d.duration_ms / 1000).toFixed(1)}s` : "—"}</td>
               <td className="px-5 py-4 text-xs text-danger-400 font-mono truncate max-w-[240px]" title={d.error_message ?? ""}>{d.error_message || "—"}</td>
               <td className="px-5 py-4 text-xs text-dark-300 font-mono">{formatDate(d.created_at)}</td>
