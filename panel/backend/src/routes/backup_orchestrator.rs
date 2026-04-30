@@ -149,6 +149,14 @@ pub struct BackupHealth {
     pub verifications_failed: i64,
     pub oldest_unverified_days: Option<i64>,
     pub stale_backups: Vec<StaleBackup>,
+    // SLA windowed view (W1.1): "of the last N backups, how many are verified?"
+    pub sla_window: i64,
+    pub sla_verified: i64,
+    pub sla_failed: i64,
+    pub sla_pending: i64,
+    pub verify_lag_p50_hours: Option<f64>,
+    pub verify_lag_p95_hours: Option<f64>,
+    pub per_server_sla: Vec<ServerSla>,
 }
 
 #[derive(serde::Serialize)]
@@ -157,6 +165,15 @@ pub struct StaleBackup {
     pub resource_name: String,
     pub last_backup: chrono::DateTime<chrono::Utc>,
     pub days_since: i64,
+}
+
+#[derive(serde::Serialize)]
+pub struct ServerSla {
+    pub server_id: Option<Uuid>,
+    pub server_name: String,
+    pub verified: i64,
+    pub total: i64,
+    pub lag_p95_hours: Option<f64>,
 }
 
 /// GET /api/backup-orchestrator/all — Unified fleet-wide backup list across site, database, and volume backups.
@@ -302,6 +319,127 @@ pub async fn health(
         }
     }).collect();
 
+    // ── SLA windowed view (W1.1) ────────────────────────────────────────────
+    // "Of the last N backups across all kinds, how many are verified?"
+    // Latest verification per (kind, backup_id) wins (re-verifications supersede).
+    const SLA_WINDOW: i64 = 30;
+    let (sla_verified, sla_failed, sla_pending): (i64, i64, i64) = sqlx::query_as(
+        "WITH all_backups AS ( \
+            SELECT id, created_at, server_id, 'site'::text AS kind FROM backups \
+            UNION ALL \
+            SELECT id, created_at, server_id, 'database'::text FROM database_backups \
+            UNION ALL \
+            SELECT id, created_at, server_id, 'volume'::text FROM volume_backups \
+         ), recent AS ( \
+            SELECT * FROM all_backups ORDER BY created_at DESC LIMIT $1 \
+         ), latest_verif AS ( \
+            SELECT DISTINCT ON (bv.backup_type, bv.backup_id) bv.backup_type, bv.backup_id, bv.status \
+            FROM backup_verifications bv \
+            JOIN recent r ON r.id = bv.backup_id AND r.kind = bv.backup_type \
+            ORDER BY bv.backup_type, bv.backup_id, bv.created_at DESC \
+         ) \
+         SELECT \
+            COUNT(*) FILTER (WHERE lv.status = 'passed')::bigint AS verified, \
+            COUNT(*) FILTER (WHERE lv.status = 'failed')::bigint AS failed, \
+            COUNT(*) FILTER (WHERE lv.status IS NULL OR lv.status IN ('pending','running'))::bigint AS pending \
+         FROM recent r \
+         LEFT JOIN latest_verif lv ON lv.backup_type = r.kind AND lv.backup_id = r.id"
+    )
+    .bind(SLA_WINDOW)
+    .fetch_one(db).await
+    .unwrap_or((0, 0, 0));
+
+    // Verify lag percentiles: hours between backup creation and verification completion,
+    // for backups created in the last 30 days that have a passed verification.
+    let (lag_p50, lag_p95): (Option<f64>, Option<f64>) = sqlx::query_as(
+        "WITH all_backups AS ( \
+            SELECT id, created_at, 'site'::text AS kind FROM backups \
+            UNION ALL \
+            SELECT id, created_at, 'database'::text FROM database_backups \
+            UNION ALL \
+            SELECT id, created_at, 'volume'::text FROM volume_backups \
+         ), lags AS ( \
+            SELECT EXTRACT(EPOCH FROM (bv.completed_at - ab.created_at)) / 3600.0 AS hours \
+            FROM backup_verifications bv \
+            JOIN all_backups ab ON ab.id = bv.backup_id AND ab.kind = bv.backup_type \
+            WHERE bv.status = 'passed' \
+              AND bv.completed_at IS NOT NULL \
+              AND ab.created_at > NOW() - INTERVAL '30 days' \
+         ) \
+         SELECT \
+            PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY hours)::float8 AS p50, \
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY hours)::float8 AS p95 \
+         FROM lags"
+    )
+    .fetch_one(db).await
+    .unwrap_or((None, None));
+
+    // Oldest unverified backup age in days (across all kinds, ignoring backups > 90d old).
+    let oldest_unverified_days: Option<i64> = sqlx::query_scalar(
+        "WITH all_backups AS ( \
+            SELECT id, created_at, 'site'::text AS kind FROM backups \
+            UNION ALL \
+            SELECT id, created_at, 'database'::text FROM database_backups \
+            UNION ALL \
+            SELECT id, created_at, 'volume'::text FROM volume_backups \
+         ) \
+         SELECT EXTRACT(DAY FROM NOW() - MIN(ab.created_at))::bigint \
+         FROM all_backups ab \
+         LEFT JOIN backup_verifications bv \
+              ON bv.backup_id = ab.id AND bv.backup_type = ab.kind AND bv.status = 'passed' \
+         WHERE bv.id IS NULL \
+           AND ab.created_at > NOW() - INTERVAL '90 days'"
+    )
+    .fetch_one(db).await
+    .ok()
+    .flatten();
+
+    // Per-server SLA: same windowed view, grouped by server_id.
+    // Bigger window (90d) here so the breakdown isn't dominated by whichever
+    // server happened to back up most recently.
+    let per_server_rows: Vec<(Option<Uuid>, String, i64, i64, Option<f64>)> = sqlx::query_as(
+        "WITH all_backups AS ( \
+            SELECT id, created_at, server_id, 'site'::text AS kind FROM backups \
+            UNION ALL \
+            SELECT id, created_at, server_id, 'database'::text FROM database_backups \
+            UNION ALL \
+            SELECT id, created_at, server_id, 'volume'::text FROM volume_backups \
+         ), recent AS ( \
+            SELECT * FROM all_backups WHERE created_at > NOW() - INTERVAL '30 days' \
+         ), latest_verif AS ( \
+            SELECT DISTINCT ON (bv.backup_type, bv.backup_id) \
+                   bv.backup_type, bv.backup_id, bv.status, bv.completed_at \
+            FROM backup_verifications bv \
+            JOIN recent r ON r.id = bv.backup_id AND r.kind = bv.backup_type \
+            ORDER BY bv.backup_type, bv.backup_id, bv.created_at DESC \
+         ), joined AS ( \
+            SELECT r.server_id, r.created_at, lv.status, lv.completed_at \
+            FROM recent r \
+            LEFT JOIN latest_verif lv ON lv.backup_type = r.kind AND lv.backup_id = r.id \
+         ) \
+         SELECT \
+            j.server_id, \
+            COALESCE(s.name, '(local)') AS server_name, \
+            COUNT(*) FILTER (WHERE j.status = 'passed')::bigint AS verified, \
+            COUNT(*)::bigint AS total, \
+            PERCENTILE_CONT(0.95) WITHIN GROUP ( \
+                ORDER BY EXTRACT(EPOCH FROM (j.completed_at - j.created_at)) / 3600.0 \
+            ) FILTER (WHERE j.status = 'passed' AND j.completed_at IS NOT NULL)::float8 AS lag_p95 \
+         FROM joined j \
+         LEFT JOIN servers s ON s.id = j.server_id \
+         GROUP BY j.server_id, s.name \
+         ORDER BY total DESC \
+         LIMIT 20"
+    )
+    .fetch_all(db).await
+    .unwrap_or_default();
+
+    let per_server_sla: Vec<ServerSla> = per_server_rows.into_iter()
+        .map(|(server_id, server_name, verified, total, lag_p95_hours)| ServerSla {
+            server_id, server_name, verified, total, lag_p95_hours,
+        })
+        .collect();
+
     Ok(Json(BackupHealth {
         total_site_backups: total_site,
         total_db_backups: total_db,
@@ -313,8 +451,15 @@ pub async fn health(
         policies_total,
         verifications_passed: verif_passed,
         verifications_failed: verif_failed,
-        oldest_unverified_days: None,
+        oldest_unverified_days,
         stale_backups,
+        sla_window: SLA_WINDOW,
+        sla_verified,
+        sla_failed,
+        sla_pending,
+        verify_lag_p50_hours: lag_p50,
+        verify_lag_p95_hours: lag_p95,
+        per_server_sla,
     }))
 }
 

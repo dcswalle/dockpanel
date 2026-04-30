@@ -4,6 +4,14 @@ import { useState, useEffect } from "react";
 import { api } from "../api";
 import { formatSize, formatDate, timeAgo } from "../utils/format";
 
+interface ServerSla {
+  server_id: string | null;
+  server_name: string;
+  verified: number;
+  total: number;
+  lag_p95_hours: number | null;
+}
+
 interface BackupHealth {
   total_site_backups: number;
   total_db_backups: number;
@@ -15,7 +23,15 @@ interface BackupHealth {
   policies_total: number;
   verifications_passed: number;
   verifications_failed: number;
+  oldest_unverified_days: number | null;
   stale_backups: { resource_type: string; resource_name: string; last_backup: string; days_since: number }[];
+  sla_window: number;
+  sla_verified: number;
+  sla_failed: number;
+  sla_pending: number;
+  verify_lag_p50_hours: number | null;
+  verify_lag_p95_hours: number | null;
+  per_server_sla: ServerSla[];
 }
 
 interface BackupPolicy {
@@ -370,6 +386,8 @@ function OverviewTab({ health }: { health: BackupHealth }) {
 
   return (
     <div className="space-y-6">
+      <SlaCard health={health} />
+
       {/* Stats Grid */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         {cards.map(c => (
@@ -399,6 +417,99 @@ function OverviewTab({ health }: { health: BackupHealth }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function formatLagHours(h: number | null): string {
+  if (h === null || h === undefined || !isFinite(h)) return "—";
+  if (h < 1) return `${Math.round(h * 60)}m`;
+  if (h < 48) return `${h.toFixed(1)}h`;
+  return `${(h / 24).toFixed(1)}d`;
+}
+
+function slaTone(verified: number, total: number): { num: string; ring: string; band: string } {
+  if (total === 0) return { num: "text-dark-200", ring: "border-dark-500", band: "bg-dark-700" };
+  const pct = (verified / total) * 100;
+  if (pct >= 95) return { num: "text-rust-400", ring: "border-rust-500/40", band: "bg-rust-500/5" };
+  if (pct >= 80) return { num: "text-warn-400", ring: "border-warn-500/40", band: "bg-warn-500/5" };
+  return { num: "text-danger-400", ring: "border-danger-500/40", band: "bg-danger-500/5" };
+}
+
+function SlaCard({ health }: { health: BackupHealth }) {
+  const total = health.sla_verified + health.sla_failed + health.sla_pending;
+  const pct = total > 0 ? Math.round((health.sla_verified / total) * 100) : 0;
+  const tone = slaTone(health.sla_verified, total);
+  const showServers = health.per_server_sla.length > 1;
+
+  return (
+    <div className={`bg-dark-800 rounded-lg border ${tone.ring} overflow-hidden`}>
+      <div className={`px-5 py-3 border-b border-dark-600 ${tone.band} flex items-center justify-between`}>
+        <h3 className="text-xs font-medium text-dark-100 uppercase font-mono tracking-widest">Restore Confidence</h3>
+        <span className="text-[10px] text-dark-300 font-mono">last {health.sla_window} backups</span>
+      </div>
+
+      {total === 0 ? (
+        <div className="px-5 py-8 text-center">
+          <p className="text-sm text-dark-200 font-mono">No recent backups to verify yet</p>
+          <p className="text-xs text-dark-300 font-mono mt-1">Run a backup or enable verify-after-backup on a policy</p>
+        </div>
+      ) : (
+        <div className="px-5 py-5 grid grid-cols-1 md:grid-cols-5 gap-4 items-center">
+          <div className="md:col-span-2 flex items-baseline gap-3">
+            <span className={`text-5xl font-mono font-medium ${tone.num}`}>{pct}%</span>
+            <div className="flex flex-col">
+              <span className="text-sm text-dark-50 font-mono">{health.sla_verified} of {total} verified</span>
+              <span className="text-xs text-dark-300 font-mono">
+                {health.sla_failed > 0 && <span className="text-danger-400">{health.sla_failed} failed</span>}
+                {health.sla_failed > 0 && health.sla_pending > 0 && " · "}
+                {health.sla_pending > 0 && <span className="text-warn-400">{health.sla_pending} pending</span>}
+                {health.sla_failed === 0 && health.sla_pending === 0 && "all clear"}
+              </span>
+            </div>
+          </div>
+
+          <SlaStat label="p50 lag" value={formatLagHours(health.verify_lag_p50_hours)} />
+          <SlaStat label="p95 lag" value={formatLagHours(health.verify_lag_p95_hours)} />
+          <SlaStat
+            label="oldest unverified"
+            value={health.oldest_unverified_days === null ? "—" : `${health.oldest_unverified_days}d`}
+            tone={health.oldest_unverified_days !== null && health.oldest_unverified_days > 7 ? "warn" : undefined}
+          />
+        </div>
+      )}
+
+      {showServers && (
+        <div className="border-t border-dark-600">
+          <div className="px-5 py-2 text-[10px] text-dark-300 uppercase font-mono tracking-widest">Per server (last 30d)</div>
+          <div className="divide-y divide-dark-600">
+            {health.per_server_sla.map((s, i) => {
+              const sTone = slaTone(s.verified, s.total);
+              const sPct = s.total > 0 ? Math.round((s.verified / s.total) * 100) : 0;
+              return (
+                <div key={s.server_id ?? `idx-${i}`} className="px-5 py-2 flex items-center justify-between text-xs font-mono">
+                  <span className="text-dark-50">{s.server_name}</span>
+                  <div className="flex items-center gap-4">
+                    <span className="text-dark-300">p95 {formatLagHours(s.lag_p95_hours)}</span>
+                    <span className="text-dark-300">{s.verified}/{s.total}</span>
+                    <span className={`${sTone.num} w-12 text-right`}>{sPct}%</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SlaStat({ label, value, tone }: { label: string; value: string; tone?: "warn" | "danger" }) {
+  const color = tone === "danger" ? "text-danger-400" : tone === "warn" ? "text-warn-400" : "text-dark-50";
+  return (
+    <div className="flex flex-col">
+      <span className="text-[10px] text-dark-300 uppercase font-mono tracking-widest">{label}</span>
+      <span className={`text-lg font-mono font-medium ${color}`}>{value}</span>
     </div>
   );
 }
