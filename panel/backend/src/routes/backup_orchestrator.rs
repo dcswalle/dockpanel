@@ -28,6 +28,9 @@ pub struct BackupPolicy {
     pub encrypt: bool,
     pub verify_after_backup: bool,
     pub enabled: bool,
+    pub drill_enabled: bool,
+    pub drill_schedule: String,
+    pub last_drill_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_run: Option<chrono::DateTime<chrono::Utc>>,
     pub last_status: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -47,6 +50,16 @@ pub struct CreatePolicyRequest {
     pub encrypt: Option<bool>,
     pub verify_after_backup: Option<bool>,
     pub enabled: Option<bool>,
+    pub drill_enabled: Option<bool>,
+    pub drill_schedule: Option<String>,
+}
+
+/// Reject obviously-invalid cron strings before they hit the DB. The
+/// scheduler's parser is 5-field whitespace-separated; same shape as the
+/// existing backup_policy_executor.
+fn is_valid_cron_5(field: &str) -> bool {
+    let parts: Vec<&str> = field.split_whitespace().collect();
+    parts.len() == 5 && parts.iter().all(|p| !p.is_empty() && p.len() <= 32)
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -525,12 +538,20 @@ pub async fn create_policy(
     }
 
     let schedule = req.schedule.unwrap_or_else(|| "0 2 * * *".into());
+    if !is_valid_cron_5(&schedule) {
+        return Err(err(StatusCode::BAD_REQUEST, "schedule must be a 5-field cron string"));
+    }
+    let drill_schedule = req.drill_schedule.unwrap_or_else(|| "0 4 * * 0".into());
+    if !is_valid_cron_5(&drill_schedule) {
+        return Err(err(StatusCode::BAD_REQUEST, "drill_schedule must be a 5-field cron string"));
+    }
     let retention = req.retention_count.unwrap_or(7).max(1).min(365);
 
     let policy: BackupPolicy = sqlx::query_as(
         "INSERT INTO backup_policies (user_id, server_id, name, backup_sites, backup_databases, backup_volumes, \
-         schedule, destination_id, retention_count, encrypt, verify_after_backup, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+         schedule, destination_id, retention_count, encrypt, verify_after_backup, enabled, \
+         drill_enabled, drill_schedule) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          RETURNING *"
     )
     .bind(claims.sub)
@@ -545,6 +566,8 @@ pub async fn create_policy(
     .bind(req.encrypt.unwrap_or(false))
     .bind(req.verify_after_backup.unwrap_or(false))
     .bind(req.enabled.unwrap_or(true))
+    .bind(req.drill_enabled.unwrap_or(false))
+    .bind(&drill_schedule)
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("create policy", e))?;
@@ -582,6 +605,17 @@ pub async fn update_policy(
 
     let retention = req.retention_count.unwrap_or(7).max(1).min(365);
 
+    if let Some(s) = &req.schedule {
+        if !s.is_empty() && !is_valid_cron_5(s) {
+            return Err(err(StatusCode::BAD_REQUEST, "schedule must be a 5-field cron string"));
+        }
+    }
+    if let Some(s) = &req.drill_schedule {
+        if !s.is_empty() && !is_valid_cron_5(s) {
+            return Err(err(StatusCode::BAD_REQUEST, "drill_schedule must be a 5-field cron string"));
+        }
+    }
+
     let policy: BackupPolicy = sqlx::query_as(
         "UPDATE backup_policies SET \
          name = COALESCE(NULLIF($2, ''), name), \
@@ -595,6 +629,8 @@ pub async fn update_policy(
          encrypt = COALESCE($10, encrypt), \
          verify_after_backup = COALESCE($11, verify_after_backup), \
          enabled = COALESCE($12, enabled), \
+         drill_enabled = COALESCE($13, drill_enabled), \
+         drill_schedule = COALESCE(NULLIF($14, ''), drill_schedule), \
          updated_at = NOW() \
          WHERE id = $1 RETURNING *"
     )
@@ -610,6 +646,8 @@ pub async fn update_policy(
     .bind(req.encrypt)
     .bind(req.verify_after_backup)
     .bind(req.enabled)
+    .bind(req.drill_enabled)
+    .bind(req.drill_schedule.as_deref().unwrap_or(""))
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("update policy", e))?;

@@ -64,6 +64,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `—` placeholder on volume rows is replaced with a working `Drill`
   button. W1.2 engine work complete; W1.2.d (per-policy weekly drill
   scheduler) is the remaining slice.
+- **Per-policy drill scheduler** (Phase 4 W1.2 part D). Backup policies
+  gain a `Drill on schedule` toggle and a separate cron `drill_schedule`
+  (default `0 4 * * 0` — 04:00 UTC Sunday) so drills run on a different
+  cadence from the backups themselves. New backend service
+  `drill_scheduler` ticks every 60s, finds policies due now, looks up
+  the latest `database_backups` and `volume_backups` row tied to each
+  policy by `policy_id`, and dispatches a real drill against each via
+  the same agent endpoints used by on-demand drills. Records land in
+  the existing `backup_drills` table — Drills tab can't tell the
+  difference between scheduled and on-demand drills (same audit
+  trail). Per-server concurrency cap = 1 (skips dispatch if a
+  `pending`/`running` drill exists for the same server). Schema
+  migration adds `drill_enabled BOOLEAN`, `drill_schedule TEXT`, and
+  `last_drill_at TIMESTAMPTZ` to `backup_policies`. Site backups don't
+  carry `policy_id` and are not covered by this scheduler — they stay
+  on the existing 6h `backup_verifier` cadence. UI: new section in the
+  Policy create form with an enabled checkbox + a curated schedule
+  selector (weekly / monthly / every 3 days), and a small `drill <cron>`
+  badge under the Schedule column on policy rows when enabled. Cron
+  validation rejects strings that aren't 5-field whitespace-separated
+  on both `schedule` and `drill_schedule` writes (was previously
+  unchecked on `schedule` too — small hardening win). W1.2 (engines +
+  scheduler) is now complete; W1.3 (chain-of-trust PDF/JSON export)
+  is the remaining Phase 4 slice before tagging v2.8.0.
 
 ## [2.7.20] - 2026-04-28
 

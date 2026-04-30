@@ -62,6 +62,9 @@ interface BackupPolicy {
   encrypt: boolean;
   verify_after_backup: boolean;
   enabled: boolean;
+  drill_enabled: boolean;
+  drill_schedule: string;
+  last_drill_at: string | null;
   last_run: string | null;
   last_status: string | null;
   created_at: string;
@@ -144,6 +147,8 @@ interface PolicyForm {
   retention_count: number;
   encrypt: boolean;
   verify_after_backup: boolean;
+  drill_enabled: boolean;
+  drill_schedule: string;
 }
 
 interface Database {
@@ -181,6 +186,7 @@ export default function BackupOrchestrator() {
     name: "", schedule: "0 2 * * *", backup_sites: true, backup_databases: true,
     backup_volumes: false, destination_id: "", retention_count: 7,
     encrypt: false, verify_after_backup: false,
+    drill_enabled: false, drill_schedule: "0 4 * * 0",
   });
 
   useEffect(() => { loadAll(); }, []);
@@ -809,6 +815,25 @@ function PoliciesTab({
               <input type="checkbox" checked={form.verify_after_backup} onChange={e => setForm({ ...form, verify_after_backup: e.target.checked })} /> Auto-verify
             </label>
           </div>
+          <div className="flex items-center gap-3 text-sm font-mono pt-2 border-t border-dark-600">
+            <label className="flex items-center gap-2 text-dark-100">
+              <input type="checkbox" checked={form.drill_enabled} onChange={e => setForm({ ...form, drill_enabled: e.target.checked })} /> Drill on schedule
+            </label>
+            <select
+              value={form.drill_schedule}
+              onChange={e => setForm({ ...form, drill_schedule: e.target.value })}
+              disabled={!form.drill_enabled}
+              className="px-3 py-1.5 bg-dark-900 border border-dark-500 rounded-lg text-xs font-mono text-dark-50 focus:ring-2 focus:ring-accent-500 outline-none disabled:opacity-50"
+            >
+              <option value="0 4 * * 0">Weekly (Sun 4 AM)</option>
+              <option value="0 4 * * 6">Weekly (Sat 4 AM)</option>
+              <option value="0 5 1 * *">Monthly (1st, 5 AM)</option>
+              <option value="0 4 */3 * *">Every 3 days</option>
+            </select>
+            <span className="text-[10px] text-dark-300">
+              End-to-end restore probe of latest db + volume backup. Site backups not yet covered.
+            </span>
+          </div>
           <div className="flex justify-end">
             <button onClick={onCreate}
               className="px-4 py-2 bg-rust-500 text-white rounded-lg text-sm font-medium font-mono hover:bg-rust-600">Create</button>
@@ -835,7 +860,14 @@ function PoliciesTab({
               {policies.map(p => (
                 <tr key={p.id} className="hover:bg-dark-700/30 transition-colors">
                   <td className="px-5 py-4 text-sm text-dark-50 font-mono">{p.name}</td>
-                  <td className="px-5 py-4 text-sm text-dark-200 font-mono">{p.schedule}</td>
+                  <td className="px-5 py-4 text-sm text-dark-200 font-mono">
+                    <div>{p.schedule}</div>
+                    {p.drill_enabled && (
+                      <div className="text-[10px] text-rust-400 mt-0.5" title={`Drill schedule: ${p.drill_schedule}${p.last_drill_at ? ` · last drilled ${timeAgo(p.last_drill_at)}` : ""}`}>
+                        drill {p.drill_schedule}
+                      </div>
+                    )}
+                  </td>
                   <td className="px-5 py-4 text-xs font-mono">
                     {p.backup_sites && <span className="inline-flex px-2 py-0.5 rounded-full bg-rust-500/15 text-rust-400 mr-1">Sites</span>}
                     {p.backup_databases && <span className="inline-flex px-2 py-0.5 rounded-full bg-accent-500/15 text-accent-400 mr-1">DBs</span>}

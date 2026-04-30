@@ -338,6 +338,9 @@ async fn main() {
     spawn_supervised("backup_policy_executor", &shutdown_tx, move |rx| services::backup_policy_executor::run(s_db.clone(), s_agent.clone(), s_jwt.clone(), rx));
 
     let (s_db, s_agent) = (state.db.clone(), state.agent.clone());
+    spawn_supervised("drill_scheduler", &shutdown_tx, move |rx| services::drill_scheduler::run(s_db.clone(), s_agent.clone(), rx));
+
+    let (s_db, s_agent) = (state.db.clone(), state.agent.clone());
     spawn_supervised("telemetry_collector", &shutdown_tx, move |rx| services::telemetry_collector::run(s_db.clone(), s_agent.clone(), rx));
 
     // Periodic cleanup of token blacklist and rate limiters (every 15 minutes)

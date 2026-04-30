@@ -6,6 +6,7 @@ pub mod backup_policy_executor;
 pub mod backup_scheduler;
 pub mod backup_verifier;
 pub mod deploy_scheduler;
+pub mod drill_scheduler;
 pub mod email;
 pub mod image_scanner;
 pub mod extensions;
