@@ -4,6 +4,24 @@ All notable changes to DockPanel will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- **Restore Confidence SLA card on Backup Orchestrator overview** (Phase 4
+  W1.1). The Overview tab now leads with a single trust signal — "of last
+  30 backups, X% verified" — sized as a headline number, color-coded by
+  threshold (rust ≥95%, warn ≥80%, danger below). Adjacent cells show p50
+  and p95 verify-lag (time from backup creation to verification
+  completion), oldest unverified backup age, and a per-server breakdown
+  table when more than one server is registered. Empty state when no
+  recent backups exist. Backend extends `GET /api/backup-orchestrator/health`
+  with `sla_window`, `sla_verified`, `sla_failed`, `sla_pending`,
+  `verify_lag_p50_hours`, `verify_lag_p95_hours`, `oldest_unverified_days`
+  (previously declared but never populated), and `per_server_sla[]`.
+  Latest verification per (backup type, backup id) wins, so re-runs
+  supersede stale entries. No schema migration; same endpoint URL.
+
 ## [2.7.20] - 2026-04-28
 
 ### Security
