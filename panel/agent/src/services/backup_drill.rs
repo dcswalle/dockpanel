@@ -488,3 +488,176 @@ async fn run_psql_scalar(container_name: &str, password: &str, db_name: &str, sq
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<i64>().unwrap_or(0))
         .unwrap_or(0)
 }
+
+// ── Volume drills (W1.2.c) ──────────────────────────────────────────────────
+//
+// Distinct from `verify_volume_backup` which only extracts the tar to a /tmp
+// dir on the host filesystem. A drill goes one step further: it restores into
+// a real Docker volume (parity with `restore_volume`'s actual restore path),
+// then mounts that volume into a fresh probe container that read-tests a
+// sample of files. Pass = tar extracts into the volume AND a sample of files
+// is byte-readable through a fresh mount.
+
+/// Volume drill: scratch Docker volume + restore container + probe container.
+///
+/// Stronger than verify because verify extracts to a host-side /tmp dir;
+/// drill exercises the actual Docker volume driver / mount path that real
+/// restores use. The probe's read-test catches filesystem-level corruption
+/// that a pure file-count check would miss.
+pub async fn drill_volume_backup(
+    container_name: &str,
+    filename: &str,
+) -> Result<DrillResult, String> {
+    let start = std::time::Instant::now();
+
+    if !is_valid_db_name(container_name) {
+        return Err("Invalid container name".to_string());
+    }
+    if !is_valid_db_name(filename) {
+        return Err("Invalid filename".to_string());
+    }
+
+    let backup_dir = format!("/var/backups/dockpanel/volumes/{container_name}");
+    let backup_path = format!("{backup_dir}/{filename}");
+    if !std::path::Path::new(&backup_path).exists() {
+        return Err("Backup file not found".to_string());
+    }
+
+    let drill_id = uuid::Uuid::new_v4().to_string();
+    let scratch_volume = format!("dockpanel-drill-vol-{}", &drill_id[..8]);
+    let restore_container = format!("dockpanel-drill-vrestore-{}", &drill_id[..8]);
+    let probe_container = format!("dockpanel-drill-vprobe-{}", &drill_id[..8]);
+
+    let result = run_volume_drill(
+        &backup_dir, filename, &scratch_volume,
+        &restore_container, &probe_container, start,
+    ).await;
+
+    // Best-effort cleanup on every exit path. Containers first (they hold
+    // the volume open), then the volume itself.
+    let _ = safe_command("docker").args(["rm", "-f", &restore_container]).output().await;
+    let _ = safe_command("docker").args(["rm", "-f", &probe_container]).output().await;
+    let _ = safe_command("docker").args(["volume", "rm", "-f", &scratch_volume]).output().await;
+
+    Ok(result)
+}
+
+async fn run_volume_drill(
+    backup_dir: &str,
+    filename: &str,
+    scratch_volume: &str,
+    restore_container: &str,
+    probe_container: &str,
+    start: std::time::Instant,
+) -> DrillResult {
+    // 1. Create scratch volume.
+    let vol_ok = safe_command("docker")
+        .args(["volume", "create", scratch_volume])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !vol_ok {
+        return drill_failure(start, "scratch volume create failed");
+    }
+
+    // 2. Restore container: alpine, --network none, mounts scratch volume RW
+    //    + backup dir RO. Pipes the tar through tar xzf — same shape as the
+    //    real `restore_volume`. tmpfs writable spots so rootfs can stay RO.
+    let restore = tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        safe_command("docker")
+            .args([
+                "run", "--rm",
+                "--name", restore_container,
+                "--network", "none",
+                "--memory=128m",
+                "--cpus=0.5",
+                "-v", &format!("{scratch_volume}:/vol"),
+                "-v", &format!("{backup_dir}:/backup:ro"),
+                "alpine:3.19",
+                "tar", "xzf", &format!("/backup/{filename}"),
+                "-C", "/vol",
+                "--no-same-owner", "--no-same-permissions",
+            ])
+            .output(),
+    )
+    .await;
+
+    let restore_ok = restore
+        .map(|r| r.map(|o| o.status.success()).unwrap_or(false))
+        .unwrap_or(false);
+    if !restore_ok {
+        return drill_failure(start, "tar restore into scratch volume failed");
+    }
+
+    // 3. Probe container: alpine, --network none, --read-only rootfs, mounts
+    //    the scratch volume RO. Counts files, sums bytes, AND read-tests up
+    //    to 20 sample files (1 byte each — enough to fault filesystem-level
+    //    corruption without scanning multi-GB volumes).
+    //
+    //    `set -e` so any pipeline failure kills the probe; explicit `wc -l`
+    //    output is captured separately for the body excerpt.
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        safe_command("docker")
+            .args([
+                "run", "--rm",
+                "--name", probe_container,
+                "--network", "none",
+                "--memory=128m",
+                "--cpus=0.5",
+                "--read-only",
+                "--tmpfs", "/tmp",
+                "-v", &format!("{scratch_volume}:/vol:ro"),
+                "alpine:3.19",
+                "sh", "-c",
+                "set -e; \
+                 files=$(find /vol -type f 2>/dev/null | wc -l); \
+                 bytes=$(du -sb /vol 2>/dev/null | awk '{print $1}'); \
+                 find /vol -type f 2>/dev/null | head -20 | xargs -r -I{} head -c 1 \"{}\" > /dev/null; \
+                 echo \"FILES=$files BYTES=$bytes\"",
+            ])
+            .output(),
+    )
+    .await;
+
+    match probe {
+        Ok(Ok(out)) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let (files, bytes) = parse_volume_probe(&stdout);
+            if files == 0 {
+                return drill_failure(start, "no files in restored volume");
+            }
+            DrillResult {
+                passed: true,
+                http_status: None,
+                body_excerpt: Some(format!("{files} files, {bytes} bytes restored")),
+                error_message: None,
+                duration_ms: start.elapsed().as_millis() as u64,
+            }
+        }
+        Ok(Ok(out)) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            drill_failure(start, format!("probe failed: {}", stderr.chars().take(200).collect::<String>()))
+        }
+        Ok(Err(e)) => drill_failure(start, format!("docker probe error: {e}")),
+        Err(_) => drill_failure(start, "volume probe timeout"),
+    }
+}
+
+/// Parse `FILES=N BYTES=M` line emitted by the probe shell.
+fn parse_volume_probe(stdout: &str) -> (i64, i64) {
+    let mut files = 0i64;
+    let mut bytes = 0i64;
+    for line in stdout.lines() {
+        for tok in line.split_whitespace() {
+            if let Some(rest) = tok.strip_prefix("FILES=") {
+                files = rest.parse().unwrap_or(0);
+            } else if let Some(rest) = tok.strip_prefix("BYTES=") {
+                bytes = rest.parse().unwrap_or(0);
+            }
+        }
+    }
+    (files, bytes)
+}

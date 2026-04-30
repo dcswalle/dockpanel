@@ -1184,24 +1184,21 @@ pub async fn list_verifications(
 
 #[derive(serde::Deserialize)]
 pub struct DrillRequest {
-    pub backup_type: String, // site | database (volume drill is W1.2.c)
+    pub backup_type: String, // site | database | volume
     pub backup_id: Uuid,
 }
 
 /// POST /api/backup-orchestrator/drill — Trigger an on-demand backup drill.
-/// Supports `backup_type = "site"` (W1.2.a) and `"database"` (W1.2.b).
-/// Volume drills land in W1.2.c.
+/// Supports `backup_type = "site"` (W1.2.a), `"database"` (W1.2.b),
+/// and `"volume"` (W1.2.c).
 pub async fn trigger_drill(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
     Json(req): Json<DrillRequest>,
 ) -> Result<(StatusCode, Json<BackupDrill>), ApiError> {
-    if req.backup_type != "site" && req.backup_type != "database" {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            "Only site and database drills are implemented in this version (volume drill coming soon)",
-        ));
+    if req.backup_type != "site" && req.backup_type != "database" && req.backup_type != "volume" {
+        return Err(err(StatusCode::BAD_REQUEST, "Unsupported backup_type"));
     }
 
     // Insert pending drill record so the UI gets immediate feedback.
@@ -1257,6 +1254,26 @@ pub async fn trigger_drill(
                     Ok(None) => Err("Database backup not found".to_string()),
                     Err(e) => {
                         tracing::warn!("DB error fetching database backup for drill: {e}");
+                        Err(format!("Database error: {e}"))
+                    }
+                }
+            }
+            "volume" => {
+                let row = sqlx::query_as::<_, (String, String)>(
+                    "SELECT container_name, filename FROM volume_backups WHERE id = $1"
+                ).bind(backup_id).fetch_optional(&db).await;
+
+                match row {
+                    Ok(Some((container_name, filename))) => {
+                        let body = serde_json::json!({
+                            "container_name": container_name,
+                            "filename": filename,
+                        });
+                        agent.post("/backups/drill/volume", Some(body)).await.map_err(|e| e.to_string())
+                    }
+                    Ok(None) => Err("Volume backup not found".to_string()),
+                    Err(e) => {
+                        tracing::warn!("DB error fetching volume backup for drill: {e}");
                         Err(format!("Database error: {e}"))
                     }
                 }

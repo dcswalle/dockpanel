@@ -57,8 +57,28 @@ async fn drill_db(
     Ok(Json(result))
 }
 
+#[derive(serde::Deserialize)]
+pub struct DrillVolumeRequest {
+    pub container_name: String,
+    pub filename: String,
+}
+
+/// POST /backups/drill/volume — Volume drill: scratch Docker volume + restore container + read-test probe.
+async fn drill_volume(
+    Json(req): Json<DrillVolumeRequest>,
+) -> Result<Json<backup_drill::DrillResult>, ApiErr> {
+    if req.container_name.is_empty() || req.filename.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "container_name and filename required"));
+    }
+    let result = backup_drill::drill_volume_backup(&req.container_name, &req.filename)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(result))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/backups/drill/site", post(drill_site))
         .route("/backups/drill/db", post(drill_db))
+        .route("/backups/drill/volume", post(drill_volume))
 }

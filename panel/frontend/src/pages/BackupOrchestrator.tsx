@@ -284,12 +284,15 @@ export default function BackupOrchestrator() {
     }
   };
 
-  const triggerDrill = async (backupId: string, backupType: "site" | "database") => {
+  const triggerDrill = async (backupId: string, backupType: "site" | "database" | "volume") => {
     try {
       await api.post("/backup-orchestrator/drill", { backup_type: backupType, backup_id: backupId });
-      const msg = backupType === "site"
-        ? "Site drill started — restoring into a scratch container, this can take 30s"
-        : "Database drill started — booting scratch engine + restoring + counting rows, this can take 60s";
+      const msg =
+        backupType === "site"
+          ? "Site drill started — restoring into a scratch container, this can take 30s"
+        : backupType === "database"
+          ? "Database drill started — booting scratch engine + restoring + counting rows, this can take 60s"
+          : "Volume drill started — restoring into a scratch volume + read-testing through a probe container, this can take 60s";
       setMessage({ text: msg, type: "success" });
       setTimeout(loadAll, 8000);
       setTimeout(loadAll, 30000);
@@ -582,7 +585,7 @@ function AllBackupsTab({
   setFilterServer: (s: string) => void;
   setFilterKind: (k: "" | "site" | "database" | "volume") => void;
   onPage: (offset: number) => void;
-  onDrill: (backupId: string, backupType: "site" | "database") => void;
+  onDrill: (backupId: string, backupType: "site" | "database" | "volume") => void;
 }) {
   const hasNext = offset + data.items.length < data.total;
   const hasPrev = offset > 0;
@@ -686,20 +689,20 @@ function AllBackupsTab({
                       <div className="text-[10px] text-dark-300">{timeAgo(row.created_at)}</div>
                     </td>
                     <td className="px-4 py-2 text-right">
-                      {row.kind === "site" || row.kind === "database" ? (
-                        <button
-                          type="button"
-                          onClick={() => onDrill(row.id, row.kind as "site" | "database")}
-                          className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
-                          title={row.kind === "site"
+                      <button
+                        type="button"
+                        onClick={() => onDrill(row.id, row.kind as "site" | "database" | "volume")}
+                        className="px-2.5 py-1 text-[10px] font-mono uppercase tracking-wider bg-dark-700 hover:bg-dark-600 text-rust-400 border border-rust-500/30 rounded"
+                        title={
+                          row.kind === "site"
                             ? "Restore into a scratch nginx and probe HTTP — proves the backup is actually deployable"
-                            : "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"}
-                        >
-                          Drill
-                        </button>
-                      ) : (
-                        <span className="text-[10px] text-dark-400 font-mono" title="Volume drill engine ships in a later release">—</span>
-                      )}
+                          : row.kind === "database"
+                            ? "Boot a scratch engine, restore the dump, count rows — proves the backup is actually queryable"
+                            : "Restore into a scratch Docker volume + read-test through a probe container — proves the backup is actually mountable"
+                        }
+                      >
+                        Drill
+                      </button>
                     </td>
                   </tr>
                 ))}
@@ -1024,14 +1027,14 @@ function DrillsTab({ drills }: { drills: Drill[] }) {
     if (d.backup_type === "site") {
       return d.http_status != null ? `HTTP ${d.http_status}` : "—";
     }
-    // database: body_excerpt holds the row/table summary
+    // database + volume: body_excerpt holds the row/table or file/byte summary
     return d.body_excerpt ?? "—";
   };
 
   return drills.length === 0 ? (
     <div className="p-12 text-center">
       <p className="text-dark-200 text-sm font-mono">No drills yet</p>
-      <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any site or database backup in the All Backups tab to do a real end-to-end restore probe.</p>
+      <p className="text-dark-300 text-xs mt-1 font-mono">Click <span className="text-rust-400">Drill</span> on any backup in the All Backups tab to do a real end-to-end restore probe.</p>
     </div>
   ) : (
     <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-x-auto">

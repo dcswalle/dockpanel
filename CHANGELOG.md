@@ -47,6 +47,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `backup_type = "database"` and dispatches to new agent route
   `POST /backups/drill/db`. Drills tab "HTTP" column renamed to "Result"
   and renders the row/table summary for DB drills. Volume drill is W1.2.c.
+- **End-to-end volume drills** (Phase 4 W1.2 part C). Click `Drill` on any
+  volume row in the All Backups tab — the agent creates a scratch Docker
+  volume, runs a hardened `alpine:3.19` restore container (`--network none`,
+  128MB / 0.5 CPU caps) that extracts the tar into the scratch volume
+  (parity with `restore_volume`'s actual restore path), then runs a second
+  read-only probe container that mounts the volume RO and read-tests up
+  to 20 sample files (`head -c 1` through each — enough to fault
+  filesystem-level corruption without scanning multi-GB volumes). Drill
+  body records `"N files, M bytes restored"`. Pass requires files > 0
+  AND read-test exit 0 — strictly stronger than verify, which only
+  extracts to a host /tmp dir. Best-effort cleanup of both containers
+  and the scratch volume on every exit path. Backend
+  `POST /api/backup-orchestrator/drill` now accepts `backup_type = "volume"`
+  and dispatches to new agent route `POST /backups/drill/volume`. The
+  `—` placeholder on volume rows is replaced with a working `Drill`
+  button. W1.2 engine work complete; W1.2.d (per-policy weekly drill
+  scheduler) is the remaining slice.
 
 ## [2.7.20] - 2026-04-28
 
