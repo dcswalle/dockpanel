@@ -256,7 +256,14 @@ async fn check_resource_thresholds(pool: &PgPool) {
             let newest = disk_trend.first().unwrap();
             let oldest = disk_trend.last().unwrap();
             let hours_diff = (newest.1 - oldest.1).num_seconds() as f64 / 3600.0;
-            if hours_diff > 0.5 {
+            // Skip the forecast on fresh installs / short trend windows. Linear
+            // extrapolation over 30-60 minutes catches the install-time write spike
+            // (binaries, frontend tarball, postgres init, container layers) and
+            // predicts "disk full in 9 hours" at <5% real usage. Require:
+            //  - at least 6 hours of trend data (so the install spike has bled out), AND
+            //  - current disk usage already over 60% (so we're actually on a runway
+            //    to a real full disk, not extrapolating from noise on an empty box).
+            if hours_diff >= 6.0 && newest.0 >= 60.0 {
                 let rate_per_hour = (newest.0 as f64 - oldest.0 as f64) / hours_diff;
                 if rate_per_hour > 0.0 {
                     let remaining_pct = 100.0 - newest.0 as f64;

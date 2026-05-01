@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.10] - 2026-05-01
+
+### Fixed
+
+- **Dashboard "Restart nginx" / "Restart PHP-FPM" buttons did nothing
+  on click** ([#48](https://github.com/ovexro/dockpanel/issues/48)
+  followup). The frontend was POSTing the wrong request shape to the
+  agent — `{ fix: "restart_nginx" }` and `{ fix: "restart_php" }`,
+  while the agent's `/diagnostics/fix` endpoint deserializes
+  `{ fix_id: "restart-service:<name>" }`. Even after deserializing,
+  the value `restart_nginx` doesn't match any of the supported
+  `apply_fix` actions. Two changes:
+  - Frontend (`panel/frontend/src/pages/Dashboard.tsx`) now sends
+    `{ fix_id: "restart-service:nginx" }` and
+    `{ fix_id: "restart-service:php-fpm" }`.
+  - Agent (`panel/agent/src/services/diagnostics.rs`) treats
+    `php-fpm` (no version) as a smart alias: it enumerates loaded
+    `php<ver>-fpm.service` (Ubuntu/Debian) or plain `php-fpm.service`
+    units via `systemctl list-units` and restarts every match, so
+    multi-version installs (PHP 8.1 + 8.2 + 8.3) all reload their
+    OPcache after the click. Returns a clear error if no PHP-FPM
+    unit is installed at all.
+
+- **Disk-full forecast fired during install on otherwise-idle
+  systems.** `services/alert_engine.rs` extrapolated linearly from
+  the most recent 60 metrics_history rows. On a fresh install the
+  first 30-60 minutes show 5-10%/hour disk growth (binary writes,
+  frontend tarball, postgres init, container layers); the
+  extrapolation predicted "disk full in 9 hours" even at 30%
+  usage. Surfaced in the same `insxa` followup on issue #48 — alerts
+  fired non-stop on a 40 GB box minutes after install. Forecast now
+  requires (a) at least 6 hours of trend data so the install spike
+  bleeds out, AND (b) current disk usage already over 60% so we're
+  on a runway to a real full disk, not extrapolating from noise on
+  an empty box. Existing thresholds (forecast horizon < 48h, severity
+  cutoff at 12h) preserved.
+
 ## [2.8.9] - 2026-05-01
 
 ### Fixed

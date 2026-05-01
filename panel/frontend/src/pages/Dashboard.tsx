@@ -611,7 +611,9 @@ export default function Dashboard() {
                   setActionMessage({ text: "Server rebooting...", type: "success" });
                   setTimeout(() => setActionMessage(null), 5000);
                 } else {
-                  await api.post("/agent/diagnostics/fix", { fix: action === "nginx" ? "restart_nginx" : "restart_php" });
+                  await api.post("/agent/diagnostics/fix", {
+                    fix_id: action === "nginx" ? "restart-service:nginx" : "restart-service:php-fpm",
+                  });
                   setActionMessage({ text: action === "nginx" ? "Nginx restarted" : "PHP-FPM restarted", type: "success" });
                   setTimeout(() => setActionMessage(null), 3000);
                 }

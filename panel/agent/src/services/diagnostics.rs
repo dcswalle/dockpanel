@@ -722,22 +722,63 @@ pub async fn apply_fix(fix_id: &str) -> Result<String, String> {
             if !target.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
                 return Err("Invalid service name".into());
             }
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                safe_command("systemctl")
-                    .args(["restart", target])
-                    .output(),
-            )
-            .await
-            .map_err(|_| "Restart timed out")?
-            .map_err(|e| format!("Failed to run systemctl: {e}"))?;
 
-            if output.status.success() {
-                Ok(format!("Service {target} restarted successfully"))
+            // Resolve the actual systemd unit(s) to restart. The panel UI sends a
+            // friendly name like "php-fpm" without a version because it can't know
+            // which PHP version is installed on this host (and there can be more
+            // than one). Expand version-less aliases here by enumerating loaded
+            // units and matching the family.
+            let services_to_restart: Vec<String> = if target == "php-fpm" {
+                // Find every loaded `php<ver>-fpm.service` unit (Debian/Ubuntu) or
+                // a plain `php-fpm.service` (some distros) and restart all of them.
+                let list = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    safe_command("systemctl")
+                        .args(["list-units", "--type=service", "--no-legend", "--plain", "--full"])
+                        .output(),
+                )
+                .await
+                .map_err(|_| "Failed to enumerate services: timed out")?
+                .map_err(|e| format!("Failed to enumerate services: {e}"))?;
+
+                let stdout = String::from_utf8_lossy(&list.stdout);
+                let units: Vec<String> = stdout
+                    .lines()
+                    .filter_map(|l| l.split_whitespace().next())
+                    .filter(|name| {
+                        let n = name.trim_end_matches(".service");
+                        n == "php-fpm" || (n.starts_with("php") && n.ends_with("-fpm"))
+                    })
+                    .map(|s| s.trim_end_matches(".service").to_string())
+                    .collect();
+                if units.is_empty() {
+                    return Err("No PHP-FPM service installed on this host".into());
+                }
+                units
             } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Err(format!("Failed to restart {target}: {stderr}"))
+                vec![target.to_string()]
+            };
+
+            let mut succeeded = Vec::new();
+            for svc in &services_to_restart {
+                let output = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    safe_command("systemctl")
+                        .args(["restart", svc])
+                        .output(),
+                )
+                .await
+                .map_err(|_| format!("Restart of {svc} timed out"))?
+                .map_err(|e| format!("Failed to run systemctl: {e}"))?;
+
+                if output.status.success() {
+                    succeeded.push(svc.clone());
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!("Failed to restart {svc}: {stderr}"));
+                }
             }
+            Ok(format!("Restarted: {}", succeeded.join(", ")))
         }
         "create-root" => {
             if target.is_empty() {
