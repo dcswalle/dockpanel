@@ -256,42 +256,39 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
 fi
 
 # ── Migrate panel nginx config to bind IPv6 (fixes site-vhost dual-stack hijack) ──
-# v2.8.3: agent site templates dual-stack `[::]:443 ssl` overshadow the panel for
-# IPv6 clients when the panel itself only binds IPv4. Pair every IPv4 listen with
-# an `ipv6only=on` IPv6 listen so each vhost owns its own protocol space.
+# v2.8.3: agent site templates declare `listen [::]:443 ssl;` (dual-stack), but
+# pre-v2.8.3 setup.sh bound the panel to IPv4 only. The first SSL site to be
+# provisioned then became the de-facto default for IPv6 traffic — WordPress
+# would 301 panel-domain requests to its canonical home_url. Fix: ensure the
+# panel vhost also has `listen [::]:80;` and `listen [::]:443 ssl;`. Plain
+# (no `ipv6only=on`) so the panel listens dual-stack on the same socket as
+# every site, and nginx routes by server_name across the shared listener.
+# Strip any `ipv6only=on` certbot may have added on prior installs to keep
+# the listener options consistent across vhosts (otherwise nginx errors with
+# "duplicate listen options" when sites add their own [::]:443 ssl block).
 NGINX_NEEDS_RELOAD=0
 for conf in /etc/nginx/sites-enabled/dockpanel-panel.conf /etc/nginx/conf.d/dockpanel-panel.conf; do
     [ -f "$conf" ] || continue
     if ! grep -qE 'listen \[::\]:80' "$conf"; then
-        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):80;[[:space:]]*$/{s//\1listen \2:80;\n\1listen [::]:80 ipv6only=on;/}' "$conf"
-        sed -i -E '0,/^([[:space:]]*)listen 80;[[:space:]]*$/{s//\1listen 80;\n\1listen [::]:80 ipv6only=on;/}' "$conf"
+        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):80;[[:space:]]*$/{s||\1listen \2:80;\n\1listen [::]:80;|}' "$conf"
+        sed -i -E '0,/^([[:space:]]*)listen 80;[[:space:]]*$/{s||\1listen 80;\n\1listen [::]:80;|}' "$conf"
         log "Added IPv6 :80 listen to $conf"
         NGINX_NEEDS_RELOAD=1
     fi
     if grep -qE 'listen [^;]*:443 ssl' "$conf" && ! grep -qE 'listen \[::\]:443' "$conf"; then
-        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):443 ssl;[[:space:]]*$/{s//\1listen \2:443 ssl;\n\1listen [::]:443 ssl ipv6only=on;/}' "$conf"
+        sed -i -E '0,/^([[:space:]]*)listen ([^;]*):443 ssl;[[:space:]]*$/{s||\1listen \2:443 ssl;\n\1listen [::]:443 ssl;|}' "$conf"
         log "Added IPv6 :443 ssl listen to $conf"
         NGINX_NEEDS_RELOAD=1
     fi
+    # Strip `ipv6only=on` from panel listens if previously added — site vhosts
+    # use plain `[::]:443 ssl;` and nginx rejects mixing the two on a shared socket.
+    if grep -qE 'listen \[::\]:(80|443 ssl) ipv6only=on' "$conf"; then
+        sed -i -E 's|^([[:space:]]*)listen \[::\]:80 ipv6only=on;|\1listen [::]:80;|' "$conf"
+        sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl ipv6only=on;|\1listen [::]:443 ssl;|' "$conf"
+        log "Stripped ipv6only=on from $conf for shared-socket compatibility"
+        NGINX_NEEDS_RELOAD=1
+    fi
 done
-# Migrate every site vhost too: add `ipv6only=on` to any plain `[::]:80` /
-# `[::]:443 ssl` listen so dual-stack sockets stop overshadowing the panel
-# (and stop overshadowing each other on multi-site installs). Leaves listens
-# that already specify ipv6only / ipv6only=off untouched.
-if [ -d /etc/nginx/sites-enabled ]; then
-    for site_conf in /etc/nginx/sites-enabled/*.conf; do
-        [ -f "$site_conf" ] || continue
-        # Skip already-migrated lines: only match listens that have no further
-        # parameters between `[::]:PORT[ ssl]` and the trailing `;`.
-        if grep -qE '^[[:space:]]*listen \[::\]:80;[[:space:]]*$' "$site_conf" \
-        || grep -qE '^[[:space:]]*listen \[::\]:443 ssl;[[:space:]]*$' "$site_conf"; then
-            sed -i -E 's|^([[:space:]]*)listen \[::\]:80;[[:space:]]*$|\1listen [::]:80 ipv6only=on;|' "$site_conf"
-            sed -i -E 's|^([[:space:]]*)listen \[::\]:443 ssl;[[:space:]]*$|\1listen [::]:443 ssl ipv6only=on;|' "$site_conf"
-            log "Migrated IPv6 listen ipv6only=on in $site_conf"
-            NGINX_NEEDS_RELOAD=1
-        fi
-    done
-fi
 if [ "$NGINX_NEEDS_RELOAD" = "1" ]; then
     if nginx -t > /dev/null 2>&1; then
         nginx -s reload > /dev/null 2>&1 && log "Nginx reloaded after IPv6 listen migration"

@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.4] - 2026-05-01
+
+### Fixed
+
+- **v2.8.3 nginx `duplicate listen options` regression on multi-site
+  installs.** v2.8.3 added `ipv6only=on` to `listen [::]:80` and
+  `listen [::]:443 ssl` in agent templates + the panel vhost to fix the
+  IPv6 hijack from #48. Two vhosts on the same shared socket both
+  declaring `ipv6only=on` caused nginx to emit `duplicate listen
+  options for [::]:80` and refuse the config — surfaced when a second
+  site was added on a v2.8.3 install. Reverted: agent templates and
+  the panel vhost now use plain `listen [::]:80;` and
+  `listen [::]:443 ssl;` (dual-stack, no `ipv6only=on`). Linux's default
+  dual-stack behaviour means a single shared `[::]` socket handles both
+  IPv6 and IPv4-without-specific-binding, and nginx routes by
+  `server_name` across that shared socket without conflict. The
+  underlying #48 fix still holds — the panel vhost gains a `[::]:` IPv6
+  listen so site vhosts can no longer be the only IPv6 listener and
+  hijack panel-domain traffic. update.sh now also strips any
+  `ipv6only=on` left on a v2.8.3 panel vhost so the upgrade path doesn't
+  inherit the regression.
+
 ## [2.8.3] - 2026-05-01
 
 ### Fixed
