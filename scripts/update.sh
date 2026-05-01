@@ -73,6 +73,25 @@ if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
     INSTALL_FROM_RELEASE=1
 fi
 
+# Auto-detect: if Rust toolchain isn't available, use release binaries.
+# Production VPS installs typically don't have cargo on PATH (and usually
+# don't have enough RAM to compile rustc's dep tree — proc-macro2 OOMs at
+# ~1-2 GB). Fall back to the pre-built artifacts on the matching tag rather
+# than asking the operator to install rustup just to update.
+if [ "$INSTALL_FROM_RELEASE" != "1" ] \
+   && ! command -v cargo > /dev/null 2>&1 \
+   && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+    log "Rust toolchain not found — switching to pre-built binary download"
+    log "(set BUILD_FROM_SOURCE=1 to force compile-from-source instead)"
+    INSTALL_FROM_RELEASE=1
+fi
+
+# Explicit opt-in to keep compile-from-source behaviour even when cargo
+# is on PATH (e.g. for developers iterating on a checkout).
+if [ "${BUILD_FROM_SOURCE:-0}" = "1" ]; then
+    INSTALL_FROM_RELEASE=0
+fi
+
 # For source builds, verify source exists
 if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
     error "Cannot find agent source at $AGENT_SRC"
@@ -150,8 +169,10 @@ else
     elif [ -f "$HOME/.cargo/bin/cargo" ]; then
         CARGO_CMD="$HOME/.cargo/bin/cargo"
     else
-        error "Rust toolchain not found. Install with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-        error "Or use: INSTALL_FROM_RELEASE=1 bash scripts/update.sh"
+        error "Rust toolchain not found, but BUILD_FROM_SOURCE=1 was requested."
+        error "Recommended: drop BUILD_FROM_SOURCE=1 — update.sh will auto-fetch pre-built binaries."
+        error "If you really want to compile from source: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        error "(note: building from source needs ~4 GB RAM — most production VPSes won't have it)"
         exit 1
     fi
 

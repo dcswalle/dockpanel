@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.6] - 2026-05-01
+
+### Fixed
+
+- **`update.sh` defaulted to compile-from-source on production VPS
+  installs that don't have Rust** — surfaced when an `insxa` follow-up
+  on [#48](https://github.com/ovexro/dockpanel/issues/48) hit
+  `Rust toolchain not found` then OOM'd on `proc-macro2` after they
+  installed rustup. The script already auto-switches to release
+  binaries when the source tree is missing, but production installs
+  *do* have the source tree (install.sh writes it) — the missing
+  signal was whether `cargo` was on `$PATH`. update.sh now also
+  auto-switches to the pre-built release binaries when the Rust
+  toolchain isn't available, so a fresh `bash /opt/dockpanel/scripts/update.sh`
+  on a stock VPS works without the operator having to know about
+  `INSTALL_FROM_RELEASE=1` or install ~4 GB of rustup. Developers who
+  *do* want to compile from source can set `BUILD_FROM_SOURCE=1` to
+  override. The "Rust toolchain not found" error message also rewords
+  to recommend dropping `BUILD_FROM_SOURCE=1` over installing rustup,
+  with the RAM-cost callout up front.
+
 ## [2.8.5] - 2026-05-01
 
 ### Fixed
