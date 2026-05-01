@@ -431,6 +431,7 @@ export default function Settings() {
           { id: "email", label: "Email" },
           { id: "account", label: "Account" },
           { id: "channels", label: "Alert Channels" },
+          { id: "services", label: "Services" },
         ].map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
             className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-t-lg transition-colors whitespace-nowrap shrink-0 ${

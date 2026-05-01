@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.11] - 2026-05-01
+
+### Fixed
+
+- **Settings → Services tab missing from the tab bar — PowerDNS / Image
+  Scan / SBOM / Prometheus config UIs unreachable from the panel for
+  over a month** ([#48](https://github.com/ovexro/dockpanel/issues/48)
+  followup). Commit `fd44a31` (2026-03-24, "UX: fix overlaps, decompose
+  Settings, create System page") removed the `{ id: "services", label:
+  "Services" }` entry from `Settings.tsx`'s tab list intending to move
+  the contents to the new System page, but the actual content block
+  (`{tab === "services" && (<>...</>)}` at lines 2169-2245) was
+  orphaned in place and never relocated. The DNS page's "configure
+  PowerDNS API in Settings" hint pointed users at a tab that didn't
+  exist. Surfaced when an `insxa` followup on issue #48 asked for a
+  screenshot of where to find the Services tab — there wasn't one.
+  Fix: restored the Services tab button so the existing content block
+  is reachable. (A proper move-to-System-page refactor remains on the
+  list but is a bigger UX restructure than tonight's scope.)
+
 ## [2.8.10] - 2026-05-01
 
 ### Fixed
