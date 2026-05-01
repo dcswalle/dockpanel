@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.8] - 2026-05-01
+
+### Fixed
+
+- **Password reset link bounced to `/login` instead of rendering the
+  reset form** ([#48](https://github.com/ovexro/exro/dockpanel/issues/48)
+  followup). When an unauthenticated user clicked the reset link from
+  their email, `ServerProvider` (mounted at the top of the SPA tree)
+  fired `api.get("/servers")` on mount → 401 because no session →
+  `api.ts`'s 401 handler redirected to `/login` because its no-redirect
+  allow-list only covered `/login` and `/setup`. Net effect: user lands
+  on the login form, never sees the reset password fields, and the
+  one-time token expires unused. Same hole hit `/forgot-password`,
+  `/register`, and `/verify-email` for any unauth visitor — though those
+  were less obviously broken because users typically reach them already
+  knowing they need to log in. Fix extends the allow-list in
+  `panel/frontend/src/api.ts` to all six top-level public routes
+  (`/login`, `/setup`, `/register`, `/forgot-password`,
+  `/reset-password`, `/verify-email`). Surfaced when an `insxa`
+  followup on issue #48 reported the bounce; the page rendering was
+  fine on the demo when probed, which made it look like an
+  email-client mangling issue at first — empirically confirmed by
+  insxa pasting the URL bar after click as `https://your-panel/login`,
+  proving a synchronous redirect from the SPA was firing. No backend
+  changes; binaries recompiled to carry the v2.8.8 version string.
+
 ## [2.8.7] - 2026-05-01
 
 ### Added

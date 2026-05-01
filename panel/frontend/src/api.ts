@@ -1,5 +1,18 @@
 const BASE = "/api";
 
+// Routes the SPA serves to unauthenticated users. A 401 from a background
+// API call (e.g. ServerProvider's /servers fetch on mount) must NOT bounce
+// the user off these pages — the user got here on purpose, usually with a
+// time-limited token in the URL that doesn't survive a full navigation.
+const PUBLIC_AUTH_PATHS = new Set([
+  "/login",
+  "/setup",
+  "/register",
+  "/forgot-password",
+  "/reset-password",
+  "/verify-email",
+]);
+
 export class ApiError extends Error {
   status: number;
   constructor(status: number, message: string) {
@@ -28,10 +41,7 @@ async function request<T = unknown>(
   });
 
   if (res.status === 401) {
-    if (
-      window.location.pathname !== "/login" &&
-      window.location.pathname !== "/setup"
-    ) {
+    if (!PUBLIC_AUTH_PATHS.has(window.location.pathname)) {
       window.location.href = "/login";
     }
     throw new ApiError(401, "Unauthorized");
