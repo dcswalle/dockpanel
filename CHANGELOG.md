@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.17] - 2026-05-06
+
+### Fixed
+
+- **Agent installers failed with `Could not get lock /var/lib/dpkg/lock-frontend`
+  when another apt was running** ([#57 follow-up](https://github.com/ovexro/dockpanel/issues/57)).
+  On fresh Debian 13 boots, `unattended-upgrades` runs in the
+  background and holds the dpkg frontend lock for several minutes.
+  The panel UI's `Install PHP 8.4` (and any other agent-driven apt
+  install/purge — services, updates) failed immediately on contention
+  instead of waiting. Both `setup.sh` (fresh installs) and `update.sh`
+  (existing operators) now drop
+  `/etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf` setting
+  `DPkg::Lock::Timeout "300";` — every apt invocation on the system
+  (agent and otherwise) now waits up to 5 minutes for the dpkg lock
+  before giving up. No agent code change needed; the config file is
+  read fresh on every apt run. Verified end-to-end on Debian 13
+  Trixie: `python3 fcntl.lockf` holding the dpkg lock for 15 s →
+  `apt-get install` waits 15 s and succeeds (vs. 0 s fail-fast pre-fix).
+- **Settings → Services → `Install Redis` (and Node.js, Composer, WAF,
+  Cloudflare Tunnel) returned 404** ([#57 follow-up](https://github.com/ovexro/dockpanel/issues/57)).
+  Latent backend gap since these services were added: the agent has
+  full install/uninstall implementations in
+  `panel/agent/src/routes/service_installer.rs`, but the backend's
+  `routes/mod.rs` only proxied install for php/certbot/ufw/fail2ban/
+  powerdns. Frontend POST to `/api/services/install/redis` (and the
+  other four) hit a non-existent route and returned 404 before
+  reaching the agent. Added the 5 missing install handlers + the 2
+  missing uninstall handlers (waf, cloudflared) in
+  `panel/backend/src/routes/system.rs` and registered all 7 routes in
+  `routes/mod.rs`. Each handler is a 5-line proxy mirroring the
+  existing pattern.
+
 ## [2.8.16] - 2026-05-06
 
 ### Fixed

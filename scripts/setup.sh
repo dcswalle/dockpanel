@@ -115,6 +115,15 @@ preflight_checks() {
 detect_pkg_manager() {
     if command -v apt-get &> /dev/null; then
         PKG_MGR="apt"
+        # Tell apt to wait up to 5 min for the dpkg lock instead of failing
+        # immediately. Without this, agent installers (PHP, services, updates)
+        # fail with "Could not get lock /var/lib/dpkg/lock-frontend" whenever
+        # unattended-upgrades is running in the background — common on fresh
+        # Debian 13 boots, where the auto-update kicks off right after install.
+        mkdir -p /etc/apt/apt.conf.d
+        cat > /etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf << 'APT_EOF'
+DPkg::Lock::Timeout "300";
+APT_EOF
     elif command -v dnf &> /dev/null; then
         PKG_MGR="dnf"
     elif command -v yum &> /dev/null; then

@@ -233,6 +233,17 @@ for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /
 done
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf 2>/dev/null || true
 
+# v2.8.17: drop apt lock-wait config so agent's apt-get install/update/purge
+# waits up to 5 min for the dpkg lock instead of failing immediately when
+# unattended-upgrades is running in the background (common on fresh Debian).
+# Idempotent — overwrites on every update.sh run, no apt operation needed.
+if command -v apt-get &> /dev/null; then
+    mkdir -p /etc/apt/apt.conf.d
+    cat > /etc/apt/apt.conf.d/99-dockpanel-lock-wait.conf << 'APT_EOF'
+DPkg::Lock::Timeout "300";
+APT_EOF
+fi
+
 # ── Refresh systemd service files (may have changed between versions) ─────
 log "Updating systemd service files..."
 # Agent unit — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)

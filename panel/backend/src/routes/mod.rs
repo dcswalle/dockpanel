@@ -959,6 +959,11 @@ pub fn router() -> Router<AppState> {
         .route("/api/services/install/ufw", post(system::install_ufw))
         .route("/api/services/install/fail2ban", post(system::install_fail2ban))
         .route("/api/services/install/powerdns", post(system::install_powerdns))
+        .route("/api/services/install/redis", post(system::install_redis))
+        .route("/api/services/install/nodejs", post(system::install_nodejs))
+        .route("/api/services/install/composer", post(system::install_composer))
+        .route("/api/services/install/waf", post(system::install_waf))
+        .route("/api/services/install/cloudflared", post(system::install_cloudflared))
         .route("/api/services/install/{install_id}/log", get(system::install_log))
         // Service uninstallers
         .route("/api/services/uninstall/php", post(system::uninstall_php))
@@ -969,6 +974,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/services/uninstall/redis", post(system::uninstall_redis))
         .route("/api/services/uninstall/nodejs", post(system::uninstall_nodejs))
         .route("/api/services/uninstall/composer", post(system::uninstall_composer))
+        .route("/api/services/uninstall/waf", post(system::uninstall_waf))
+        .route("/api/services/uninstall/cloudflared", post(system::uninstall_cloudflared))
         // Mail
         .route("/api/mail/status", get(mail::mail_status))
         .route("/api/mail/install", post(mail::mail_install))

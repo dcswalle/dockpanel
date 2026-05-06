@@ -616,6 +616,46 @@ pub async fn install_fail2ban(
     install_service_with_log(&state, agent, claims.sub, &claims.email, "Fail2Ban", "/services/install/fail2ban").await
 }
 
+pub async fn install_redis(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "Redis", "/services/install/redis").await
+}
+
+pub async fn install_nodejs(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "Node.js", "/services/install/nodejs").await
+}
+
+pub async fn install_composer(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "Composer", "/services/install/composer").await
+}
+
+pub async fn install_waf(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "WAF (ModSecurity)", "/services/install/waf").await
+}
+
+pub async fn install_cloudflared(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "Cloudflare Tunnel", "/services/install/cloudflared").await
+}
+
 // ── Service uninstallers (proxy to agent, async with SSE progress) ───────
 
 pub async fn uninstall_php(
@@ -680,6 +720,22 @@ pub async fn uninstall_composer(
     ServerScope(_server_id, agent): ServerScope,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     install_service_with_log(&state, agent, claims.sub, &claims.email, "Composer (uninstall)", "/services/uninstall/composer").await
+}
+
+pub async fn uninstall_waf(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "WAF (uninstall)", "/services/uninstall/waf").await
+}
+
+pub async fn uninstall_cloudflared(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    install_service_with_log(&state, agent, claims.sub, &claims.email, "Cloudflare Tunnel (uninstall)", "/services/uninstall/cloudflared").await
 }
 
 /// POST /api/traefik/install — Install Traefik reverse proxy.
