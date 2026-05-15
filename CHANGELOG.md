@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.20] - 2026-05-15
+
+### Fixed
+
+- **WAF install button stayed on "Install" after a successful install on
+  Ubuntu 24.04** ([#57] follow-up by @WiskeyPapa). Ubuntu Noble's
+  `time_t`-64 ABI transition renamed `libmodsecurity3` →
+  `libmodsecurity3t64` as a virtual-provides (no transitional shim). The
+  agent's `install_status` route was checking `dpkg -l libmodsecurity3`
+  literally, which never matches "ii" on Noble even though the install
+  succeeded — frontend therefore kept showing "Install". Detect path in
+  `routes/service_installer.rs::install_status` now accepts either name
+  (OR-clause, matching the existing PHP fallback pattern). Same fix
+  applied to `uninstall_waf`'s apt purge list so uninstall on Noble
+  actually removes the package instead of silently no-op'ing.
+
 ## [2.8.19] - 2026-05-10
 
 ### Fixed

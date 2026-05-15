@@ -68,8 +68,12 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
     let nodejs_installed = which("node").await;
     let composer_installed = which("composer").await;
 
+    // Ubuntu 24.04 (Noble) renamed libmodsecurity3 → libmodsecurity3t64 in the
+    // time_t-64 ABI transition (virtual-provides, no transitional shim). Check
+    // both names so the install-state detect works on Noble and Debian alike.
     let waf_installed = std::path::Path::new("/etc/modsecurity/modsecurity.conf").exists()
-        && is_installed("libmodsecurity3").await;
+        && (is_installed("libmodsecurity3").await
+            || is_installed("libmodsecurity3t64").await);
 
     let cloudflared_installed = which("cloudflared").await;
     let cloudflared_running = is_active("cloudflared").await;
@@ -948,7 +952,7 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
     let output = tokio::time::timeout(
         Duration::from_secs(300),
         safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y libnginx-mod-http-modsecurity libmodsecurity3 && apt-get autoremove -y"])
+            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y libnginx-mod-http-modsecurity libmodsecurity3 libmodsecurity3t64 && apt-get autoremove -y"])
             .output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "WAF uninstall timed out"))?
