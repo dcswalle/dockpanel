@@ -768,3 +768,36 @@ Create a webhook integration.
 | GET | `/api/deploy-approvals` | List pending approvals |
 | POST | `/api/deploy-approvals/{id}/approve` | Approve deploy |
 | POST | `/api/deploy-approvals/{id}/reject` | Reject deploy |
+
+---
+
+## Panel Self-Update (v2.10.0+, Phase 4 W4)
+
+Admin-only endpoints to drive panel updates from the UI instead of SSH.
+The orchestrator shells out to `scripts/update.sh` under
+`DOCKPANEL_NO_SELF_REFRESH=1 + DOCKPANEL_VERSION=<target>` rather than
+reimplementing binary swap — every bug fix in update.sh keeps working.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET    | `/api/update/status` | Current update state + version + channel |
+| POST   | `/api/update/manual-check` | Force a `/releases` poll now (bypasses `hold`) |
+| POST   | `/api/update/apply` | Snapshot + invoke update.sh. `{target_version: "v2.10.0"}` must match advertised version |
+| POST   | `/api/update/rollback` | Restore from snapshot. `{snapshot_id: "<uuid>"}`. Destructive — DB is also restored |
+| GET    | `/api/update/channel` | Read current channel (`stable` \| `candidate` \| `hold`) |
+| PUT    | `/api/update/channel` | Set channel. `{channel: "candidate"}` |
+| GET    | `/api/snapshots` | List panel snapshots (newest first) |
+| POST   | `/api/snapshots` | Create a manual snapshot. Empty body. Returns the new snapshot row |
+| DELETE | `/api/snapshots/{id}` | Delete a snapshot (file + DB row) |
+| GET    | `/api/update/fleet` | List recent fleet update runs |
+| POST   | `/api/update/fleet` | Start a fleet rolling update. `{target_version, halt_on_failure?, include_panel?}` |
+| GET    | `/api/update/fleet/{id}` | Fleet run detail (plan + per-server progress) |
+
+Agent-side (called by the orchestrator over the agent's bearer-auth API):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST   | `/panel/update` | Kick off update.sh on the agent host. `{target_version}` |
+| GET    | `/panel/update/status` | Best-effort agent-local state during apply |
+
+Note: distinct from `/system/updates/*` (OS-package apt-get mgmt).
