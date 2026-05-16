@@ -6,6 +6,35 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.21] - 2026-05-16
+
+### Fixed
+
+- **Firewall add/remove rule returned "Agent offline" with `ufw: ERROR:
+  '/etc/ufw/user.rules' is not writable`** ([#57] follow-up by @WiskeyPapa).
+  The agent runs under `ProtectSystem=strict` with an explicit
+  `ReadWritePaths=` allowlist, and `/etc/ufw` was never in that list. `ufw
+  status` (read-only) worked, but writes to `user.rules` during add/delete
+  were blocked by the sandbox mount. Added `/etc/ufw` and `/var/lib/ufw` to
+  the canonical agent unit's `ReadWritePaths`, plus matching pre-create
+  entries in `scripts/setup.sh` and `scripts/update.sh` so the namespace
+  mount succeeds even on systems where ufw isn't installed yet. Same shape
+  of fix as the v2.8.13 expansion that added `/etc/modsecurity` /
+  `/etc/cloudflared` / `/etc/postfix` to the RWP list.
+
+- **Dashboard "Set up backups" onboarding step stayed incomplete after a
+  manual backup ran, and the card linked to Sites instead of the Backups
+  page** ([#57] follow-up by @WiskeyPapa). The completion check was
+  `sitesList.some(s => !!s.backup_schedule)`, but `/api/sites` doesn't
+  return a `backup_schedule` field — so the check was always false
+  regardless of how many backups had been created. Added a new
+  `GET /api/backup-setup-status` endpoint (auth-gated, scoped by user)
+  returning `{ has_schedule, has_backup }` derived from real DB counts
+  across `backup_schedules`, `backups`, `database_backups`, and
+  `volume_backups`. Dashboard now fetches the status once and the card
+  flips to complete as soon as any of those exist. Link retargeted from
+  `/sites/<id>` to `/backup-orchestrator` (the global backup view).
+
 ## [2.8.20] - 2026-05-15
 
 ### Fixed
