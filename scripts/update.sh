@@ -228,7 +228,8 @@ mkdir -p /var/lib/dockpanel/git
 # missing entries, so pre-create everything the canonical unit references.
 for d in /etc/postfix /etc/dovecot /var/vmail /var/spool/postfix /run/opendkim /var/lib/nginx \
          /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns /etc/letsencrypt \
-         /var/cache/nginx/fastcgi; do
+         /var/cache/nginx/fastcgi \
+         /etc/ufw /var/lib/ufw; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf 2>/dev/null || true

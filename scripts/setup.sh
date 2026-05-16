@@ -359,6 +359,7 @@ create_directories() {
     mkdir -p /etc/php /var/spool/cron /var/lib/dockpanel/git /var/lib/dockpanel/recordings
     mkdir -p /etc/cloudflared /etc/modsecurity /etc/fail2ban /etc/powerdns
     mkdir -p /var/cache/nginx/fastcgi
+    mkdir -p /etc/ufw /var/lib/ufw
     touch /etc/opendkim.conf /run/nginx.pid 2>/dev/null || true
 
     log "Directories created"

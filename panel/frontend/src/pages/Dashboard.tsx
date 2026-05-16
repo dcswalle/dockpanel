@@ -7,7 +7,6 @@ interface SiteDetail {
   id: string;
   domain?: string;
   status: string;
-  backup_schedule?: string;
 }
 
 interface ActivityItem {
@@ -216,6 +215,7 @@ export default function Dashboard() {
   const [onboardingCollapsed, setOnboardingCollapsed] = useState(() => localStorage.getItem('dp-onboarding-collapsed') === '1');
   const [metricsHistory, setMetricsHistory] = useState<MetricPoint[]>([]);
   const [twoFaEnabled, setTwoFaEnabled] = useState(false);
+  const [backupSetup, setBackupSetup] = useState<{ has_schedule: boolean; has_backup: boolean }>({ has_schedule: false, has_backup: false });
   const [sitesList, setSitesList] = useState<SiteDetail[]>([]);
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
@@ -299,6 +299,10 @@ export default function Dashboard() {
     api
       .get<{ enabled: boolean }>("/auth/2fa/status")
       .then((d) => setTwoFaEnabled(d.enabled))
+      .catch(() => {});
+    api
+      .get<{ has_schedule: boolean; has_backup: boolean }>("/backup-setup-status")
+      .then(setBackupSetup)
       .catch(() => {});
     // Feature #1: Docker container overview
     api
@@ -664,7 +668,7 @@ export default function Dashboard() {
           { id: "site", label: "Create your first site", description: "Set up a website with Nginx, PHP, or reverse proxy", link: "/sites", check: () => sites.total > 0 },
           { id: "app", label: "Deploy a Docker app", description: "One-click deploy from 151 templates", link: "/apps", check: () => appCount > 0 },
           { id: "2fa", label: "Enable 2FA", description: "Protect your panel with two-factor authentication", link: "/settings", check: () => twoFaEnabled },
-          { id: "backup", label: "Set up backups", description: "Set up backups for any site", link: sitesList.length > 0 ? `/sites/${sitesList[0].id}` : "/sites", check: () => sitesList.some(s => !!s.backup_schedule) },
+          { id: "backup", label: "Set up backups", description: "Schedule recurring backups or run one manually", link: "/backup-orchestrator", check: () => backupSetup.has_schedule || backupSetup.has_backup },
           { id: "diagnostics", label: "Run diagnostics", description: "Check your server health and fix issues", link: "/diagnostics", check: () => true },
         ];
         const completed = steps.filter(s => s.check()).length;

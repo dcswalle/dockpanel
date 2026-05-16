@@ -545,6 +545,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/backup-destinations/{id}/test", post(backup_destinations::test_connection))
         // Backup Schedules
         .route("/api/sites/{id}/backup-schedule", get(backup_schedules::get_schedule).put(backup_schedules::set_schedule).delete(backup_schedules::remove_schedule))
+        .route("/api/backup-setup-status", get(backup_schedules::setup_status))
         // Crons
         .route("/api/sites/{id}/crons", get(crons::list).post(crons::create))
         .route("/api/sites/{id}/crons/{cron_id}", put(crons::update).delete(crons::remove))
