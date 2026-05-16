@@ -31,6 +31,15 @@ pub struct AlertRow {
     notified_at: chrono::DateTime<chrono::Utc>,
     resolved_at: Option<chrono::DateTime<chrono::Utc>>,
     acknowledged_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Phase 4 W3: actor who ack'd (NULL on legacy rows + un-ack'd alerts).
+    acknowledged_by: Option<Uuid>,
+    /// Resolved via LEFT JOIN users — surfaces email for the UI's "Ack by"
+    /// column without forcing the frontend into N+1 lookups.
+    acknowledged_by_email: Option<String>,
+    /// Phase 4 W3: optional free-text note from the actor (500-char cap).
+    acknowledged_comment: Option<String>,
+    /// Phase 4 W3: position in the policy chain — 0 means initial fire.
+    escalation_step_index: i32,
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -43,25 +52,31 @@ pub async fn list(
 ) -> Result<Json<Vec<AlertRow>>, ApiError> {
     let limit = q.limit.unwrap_or(100).min(500);
 
-    // Build dynamic query — server_id always filtered via ServerScope
+    // Build dynamic query — server_id always filtered via ServerScope.
+    // LEFT JOIN users resolves acknowledged_by → email for the UI without
+    // forcing N+1 fetches from the frontend.
     let mut sql = String::from(
-        "SELECT id, server_id, site_id, alert_type, severity, title, message, \
-         status, notified_at, resolved_at, acknowledged_at, created_at \
-         FROM alerts WHERE user_id = $1 AND server_id = $2",
+        "SELECT a.id, a.server_id, a.site_id, a.alert_type, a.severity, a.title, \
+                a.message, a.status, a.notified_at, a.resolved_at, a.acknowledged_at, \
+                a.acknowledged_by, u.email AS acknowledged_by_email, \
+                a.acknowledged_comment, a.escalation_step_index, a.created_at \
+         FROM alerts a \
+         LEFT JOIN users u ON u.id = a.acknowledged_by \
+         WHERE a.user_id = $1 AND a.server_id = $2",
     );
     let mut param_idx = 3;
 
     if q.status.is_some() {
-        sql.push_str(&format!(" AND status = ${param_idx}"));
+        sql.push_str(&format!(" AND a.status = ${param_idx}"));
         param_idx += 1;
     }
     if q.alert_type.is_some() {
-        sql.push_str(&format!(" AND alert_type = ${param_idx}"));
+        sql.push_str(&format!(" AND a.alert_type = ${param_idx}"));
         #[allow(unused_assignments)]
         { param_idx += 1; }
     }
 
-    sql.push_str(&format!(" ORDER BY created_at DESC LIMIT {limit}"));
+    sql.push_str(&format!(" ORDER BY a.created_at DESC LIMIT {limit}"));
 
     let mut query = sqlx::query_as::<_, AlertRow>(&sql)
         .bind(claims.sub)
@@ -122,18 +137,52 @@ pub async fn summary(
     })))
 }
 
+/// Phase 4 W3: optional payload for `acknowledge`. Empty body still works
+/// — `Option<Json<…>>` returns `None` when no body / no content-type, so
+/// older clients that PUT with no body keep functioning.
+#[derive(serde::Deserialize, Default)]
+pub struct AcknowledgePayload {
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 /// PUT /api/alerts/{id}/acknowledge — Acknowledge an alert.
+///
+/// Phase 4 W3: stores the acting user (`claims.sub`) on the row plus an
+/// optional 500-char comment. Older clients that PUT with no body still
+/// work — the only state difference is `acknowledged_by` instead of NULL.
 pub async fn acknowledge(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
+    body: Option<Json<AcknowledgePayload>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let payload = body.map(|j| j.0).unwrap_or_default();
+    let comment = payload
+        .comment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if let Some(ref c) = comment {
+        // Char count, not byte length — runs cap is "what the operator typed."
+        if c.chars().count() > 500 {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "Comment cannot exceed 500 characters",
+            ));
+        }
+    }
+
     let result = sqlx::query(
-        "UPDATE alerts SET status = 'acknowledged', acknowledged_at = NOW() \
+        "UPDATE alerts SET status = 'acknowledged', acknowledged_at = NOW(), \
+                          acknowledged_by = $3, acknowledged_comment = $4 \
          WHERE id = $1 AND user_id = $2 AND status = 'firing'",
     )
     .bind(id)
     .bind(claims.sub)
+    .bind(claims.sub)
+    .bind(comment.as_deref())
     .execute(&state.db)
     .await
     .map_err(|e| internal_error("acknowledge", e))?;
@@ -199,6 +248,9 @@ pub struct AlertRuleRow {
     gpu_temp_threshold: i32,
     gpu_vram_threshold: i32,
     alert_gpu: bool,
+    /// Phase 4 W3: escalation policy attached to this rule. NULL = pre-W3
+    /// hardcoded cadence (15 min unack → 30 min re-page).
+    escalation_policy_id: Option<Uuid>,
 }
 
 /// GET /api/alert-rules — Get user's alert rules.
@@ -212,7 +264,8 @@ pub async fn get_rules(
          alert_backup_failure, alert_ssl_expiry, alert_service_health, \
          ssl_warning_days, notify_email, notify_slack_url, notify_discord_url, cooldown_minutes, \
          notify_pagerduty_key, notify_webhook_url, muted_types, \
-         gpu_util_threshold, gpu_util_duration, gpu_temp_threshold, gpu_vram_threshold, alert_gpu \
+         gpu_util_threshold, gpu_util_duration, gpu_temp_threshold, gpu_vram_threshold, alert_gpu, \
+         escalation_policy_id \
          FROM alert_rules WHERE user_id = $1 ORDER BY server_id NULLS FIRST LIMIT 500",
     )
     .bind(claims.sub)
@@ -399,6 +452,51 @@ async fn upsert_rules(
     .await
     .map_err(|e| internal_error("update server rules", e))?;
 
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Phase 4 W3: payload for attaching/detaching an escalation policy.
+/// `policy_id = null` clears the attachment (rule reverts to pre-W3
+/// hardcoded cadence).
+#[derive(serde::Deserialize)]
+pub struct AttachPolicy {
+    pub policy_id: Option<Uuid>,
+}
+
+/// PUT /api/alert-rules/{rule_id}/escalation-policy — Admin: attach or
+/// detach an escalation policy on a single rule. Admin-only because
+/// mis-attaching a policy can route 3 AM pages to the wrong on-call user.
+pub async fn attach_escalation_policy(
+    State(state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    Path(rule_id): Path<Uuid>,
+    Json(body): Json<AttachPolicy>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // If setting (not clearing), verify the policy exists so the FK violation
+    // surfaces as a 400 instead of a 500.
+    if let Some(pid) = body.policy_id {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM escalation_policies WHERE id = $1)",
+        )
+        .bind(pid)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| internal_error("check policy exists", e))?;
+        if !exists {
+            return Err(err(StatusCode::BAD_REQUEST, "Policy not found"));
+        }
+    }
+    let result = sqlx::query(
+        "UPDATE alert_rules SET escalation_policy_id = $2, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(rule_id)
+    .bind(body.policy_id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| internal_error("attach policy", e))?;
+    if result.rows_affected() == 0 {
+        return Err(err(StatusCode::NOT_FOUND, "Alert rule not found"));
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 

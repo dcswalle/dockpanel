@@ -15,7 +15,43 @@ interface Alert {
   notified_at: string;
   resolved_at: string | null;
   acknowledged_at: string | null;
+  // Phase 4 W3: ack actor + optional comment, plus the escalation chain
+  // position. Older alerts (pre-v2.9.0) have null/0 here.
+  acknowledged_by: string | null;
+  acknowledged_by_email: string | null;
+  acknowledged_comment: string | null;
+  escalation_step_index: number;
   created_at: string;
+}
+
+interface MemberInfo {
+  id: string;
+  email: string;
+}
+
+interface OnCallSchedule {
+  id: string;
+  name: string;
+  cadence_days: number;
+  anchor_at: string;
+  members: MemberInfo[];
+  current_on_call: MemberInfo | null;
+  created_at: string;
+  updated_at: string;
+}
+
+interface EscalationStep {
+  after_minutes: number;
+  route: string;
+}
+
+interface EscalationPolicy {
+  id: string;
+  name: string;
+  steps: EscalationStep[];
+  used_by_rule_count: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface AlertSummary {
@@ -58,7 +94,7 @@ const SEVERITY_STYLES: Record<string, { bg: string; text: string; dot: string }>
   info: { bg: "bg-accent-500/10", text: "text-accent-400", dot: "bg-accent-500" },
 };
 
-type TabId = "alerts" | "runbooks";
+type TabId = "alerts" | "runbooks" | "on-call" | "policies";
 
 export default function Alerts() {
   const [tab, setTab] = useState<TabId>("alerts");
@@ -70,6 +106,9 @@ export default function Alerts() {
   const [message, setMessage] = useState<{text: string; type: string} | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [runbookCache, setRunbookCache] = useState<Record<string, Runbook | null>>({});
+  // Phase 4 W3: which alert ID has the ack popover open + the current comment draft.
+  const [ackPopover, setAckPopover] = useState<string | null>(null);
+  const [ackComment, setAckComment] = useState("");
   const refreshTimer = useRef<ReturnType<typeof setInterval>>(undefined);
 
   const toggleExpand = async (alert: Alert) => {
@@ -116,17 +155,32 @@ export default function Alerts() {
     };
   }, [statusFilter, typeFilter, tab]);
 
-  const handleAcknowledge = async (id: string) => {
+  const handleAcknowledge = async (id: string, comment?: string) => {
     try {
-      await api.put(`/alerts/${id}/acknowledge`, {});
+      const body = comment && comment.trim() ? { comment: comment.trim() } : {};
+      await api.put(`/alerts/${id}/acknowledge`, body);
       setMessage({ text: "Alert acknowledged", type: "success" });
       setTimeout(() => setMessage(null), 3000);
+      setAckPopover(null);
+      setAckComment("");
       fetchAlerts();
     } catch (e) {
       logger.error("Failed to acknowledge alert:", e);
-      setMessage({ text: "Failed to acknowledge alert", type: "error" });
+      // Surface 400s from the 500-char cap so operators get a meaningful nudge.
+      const detail = (e as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      setMessage({ text: detail || "Failed to acknowledge alert", type: "error" });
       setTimeout(() => setMessage(null), 3000);
     }
+  };
+
+  const openAckPopover = (id: string) => {
+    setAckPopover(id);
+    setAckComment("");
+  };
+
+  const cancelAckPopover = () => {
+    setAckPopover(null);
+    setAckComment("");
   };
 
   const handleResolve = async (id: string) => {
@@ -193,6 +247,26 @@ export default function Alerts() {
           }`}
         >
           Runbooks
+        </button>
+        <button
+          onClick={() => setTab("on-call")}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+            tab === "on-call"
+              ? "border-rust-500 text-rust-400"
+              : "border-transparent text-dark-200 hover:text-dark-100"
+          }`}
+        >
+          On-call
+        </button>
+        <button
+          onClick={() => setTab("policies")}
+          className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+            tab === "policies"
+              ? "border-rust-500 text-rust-400"
+              : "border-transparent text-dark-200 hover:text-dark-100"
+          }`}
+        >
+          Escalation policies
         </button>
       </div>
 
@@ -326,14 +400,37 @@ export default function Alerts() {
                               {ago(alert.created_at)}
                               {alert.resolved_at && ` -- resolved ${ago(alert.resolved_at)}`}
                               {alert.acknowledged_at && !alert.resolved_at && ` -- acknowledged ${ago(alert.acknowledged_at)}`}
+                              {alert.escalation_step_index > 0 && (
+                                <span className="ml-2 px-1.5 py-0.5 rounded bg-warn-500/15 text-warn-400">
+                                  escalated · step {alert.escalation_step_index}
+                                </span>
+                              )}
                             </p>
+                            {alert.acknowledged_by_email && (
+                              <p className="text-xs text-dark-200 mt-1">
+                                <span className="text-dark-300">Acknowledged by</span>{" "}
+                                <span className="text-dark-100">{alert.acknowledged_by_email}</span>
+                                {alert.acknowledged_comment && (
+                                  <span
+                                    className="ml-2 italic text-dark-200"
+                                    title={alert.acknowledged_comment}
+                                  >
+                                    "
+                                    {alert.acknowledged_comment.length > 80
+                                      ? alert.acknowledged_comment.slice(0, 80) + "…"
+                                      : alert.acknowledged_comment}
+                                    "
+                                  </span>
+                                )}
+                              </p>
+                            )}
                           </div>
                         </div>
                         <div className="flex gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
-                          {alert.status === "firing" && (
+                          {alert.status === "firing" && ackPopover !== alert.id && (
                             <>
                               <button
-                                onClick={() => handleAcknowledge(alert.id)}
+                                onClick={() => openAckPopover(alert.id)}
                                 className="px-2.5 py-1 bg-warn-500/15 text-warn-400 rounded-lg text-xs hover:bg-warn-500/25"
                               >
                                 Ack
@@ -356,6 +453,44 @@ export default function Alerts() {
                           )}
                         </div>
                       </div>
+                      {ackPopover === alert.id && (
+                        <div
+                          className="mt-3 p-3 bg-dark-900/70 border border-warn-500/30 rounded-lg"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <label className="text-xs text-dark-200 block mb-1">
+                            Acknowledge — optional comment (max 500 chars)
+                          </label>
+                          <textarea
+                            value={ackComment}
+                            onChange={(e) => setAckComment(e.target.value)}
+                            maxLength={500}
+                            rows={2}
+                            placeholder="e.g. 'looking into it — disk forecast model is hot, no action needed'"
+                            className="w-full bg-dark-800 text-dark-100 text-sm border border-dark-500 rounded p-2 outline-none focus:border-warn-500/50"
+                            autoFocus
+                          />
+                          <div className="flex items-center justify-between mt-2">
+                            <span className="text-xs text-dark-300">
+                              {ackComment.length}/500
+                            </span>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={cancelAckPopover}
+                                className="px-2.5 py-1 bg-dark-700 text-dark-200 rounded-lg text-xs hover:bg-dark-600"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={() => handleAcknowledge(alert.id, ackComment)}
+                                className="px-2.5 py-1 bg-warn-500 text-white rounded-lg text-xs font-medium hover:bg-warn-600"
+                              >
+                                Acknowledge
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
                     {isOpen && (
                       <div className="border-t border-dark-500 bg-dark-900/40 px-4 py-3">
@@ -380,6 +515,8 @@ export default function Alerts() {
       )}
 
       {tab === "runbooks" && <RunbooksTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
+      {tab === "on-call" && <OnCallTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
+      {tab === "policies" && <PoliciesTab onMessage={(m) => { setMessage(m); setTimeout(() => setMessage(null), 3000); }} />}
 
       </div>
     </div>
@@ -637,6 +774,742 @@ function RunbooksTab({ onMessage }: { onMessage: (m: { text: string; type: strin
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 W3: On-call rotation editor
+// ---------------------------------------------------------------------------
+
+function OnCallTab({ onMessage }: { onMessage: (m: { text: string; type: string }) => void }) {
+  const [schedules, setSchedules] = useState<OnCallSchedule[]>([]);
+  const [users, setUsers] = useState<MemberInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState<OnCallSchedule | null>(null);
+  const [draftName, setDraftName] = useState("");
+  const [draftMembers, setDraftMembers] = useState<string[]>([]);
+  const [draftCadence, setDraftCadence] = useState(7);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  const fetchSchedules = async () => {
+    try {
+      const data = await api.get<OnCallSchedule[]>("/on-call/schedules");
+      setSchedules(data);
+    } catch (e) {
+      logger.error("Failed to load schedules:", e);
+      onMessage({ text: "Failed to load on-call schedules", type: "error" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchUsers = async () => {
+    try {
+      // Reuse the standard admin users endpoint; it returns full user rows so
+      // we project down to {id, email} pairs for the member picker.
+      const data = await api.get<{ id: string; email: string }[]>("/users");
+      setUsers(data.map((u) => ({ id: u.id, email: u.email })));
+    } catch (e) {
+      logger.error("Failed to load users:", e);
+    }
+  };
+
+  useEffect(() => {
+    fetchSchedules();
+    fetchUsers();
+  }, []);
+
+  const openNew = () => {
+    setEditing({
+      id: "",
+      name: "",
+      cadence_days: 7,
+      anchor_at: new Date().toISOString(),
+      members: [],
+      current_on_call: null,
+      created_at: "",
+      updated_at: "",
+    });
+    setDraftName("");
+    setDraftMembers([]);
+    setDraftCadence(7);
+  };
+
+  const openEdit = (s: OnCallSchedule) => {
+    setEditing(s);
+    setDraftName(s.name);
+    setDraftMembers(s.members.map((m) => m.id));
+    setDraftCadence(s.cadence_days);
+  };
+
+  const closeEdit = () => {
+    setEditing(null);
+  };
+
+  const save = async () => {
+    if (!editing) return;
+    if (!draftName.trim()) {
+      onMessage({ text: "Name is required", type: "error" });
+      return;
+    }
+    if (draftMembers.length === 0) {
+      onMessage({ text: "At least one member is required", type: "error" });
+      return;
+    }
+    const body = {
+      name: draftName.trim(),
+      members: draftMembers,
+      cadence_days: draftCadence,
+    };
+    try {
+      if (editing.id) {
+        await api.put(`/on-call/schedules/${editing.id}`, body);
+      } else {
+        await api.post(`/on-call/schedules`, body);
+      }
+      onMessage({ text: "Schedule saved", type: "success" });
+      closeEdit();
+      fetchSchedules();
+    } catch (e) {
+      logger.error("Failed to save schedule:", e);
+      const detail = (e as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      onMessage({ text: detail || "Failed to save schedule", type: "error" });
+    }
+  };
+
+  const remove = async (id: string) => {
+    try {
+      await api.delete(`/on-call/schedules/${id}`);
+      onMessage({ text: "Schedule deleted", type: "success" });
+      setConfirmDelete(null);
+      fetchSchedules();
+    } catch (e) {
+      logger.error("Failed to delete schedule:", e);
+      onMessage({ text: "Failed to delete schedule", type: "error" });
+    }
+  };
+
+  const moveMember = (idx: number, direction: -1 | 1) => {
+    const next = [...draftMembers];
+    const target = idx + direction;
+    if (target < 0 || target >= next.length) return;
+    [next[idx], next[target]] = [next[target], next[idx]];
+    setDraftMembers(next);
+  };
+
+  return (
+    <div>
+      <div className="bg-dark-800 border border-dark-500 rounded-lg p-4 mb-6">
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div className="min-w-0 max-w-2xl">
+            <h2 className="font-medium text-dark-50 mb-1">On-call rotations</h2>
+            <p className="text-sm text-dark-200">
+              Ordered list of users plus a cadence (in days). Whoever the
+              rotation lands on right now is the one paged when an escalation
+              policy routes to <code className="text-dark-100">on_call_schedule:&lt;id&gt;</code>.
+              No calendar, no overrides — keep the list small, advance by days.
+            </p>
+          </div>
+          <button
+            onClick={openNew}
+            className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 shrink-0"
+          >
+            New rotation
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="space-y-3">
+          {[1, 2].map((i) => (
+            <div key={i} className="h-20 bg-dark-800 rounded-lg animate-pulse" />
+          ))}
+        </div>
+      ) : schedules.length === 0 ? (
+        <div className="text-center py-12 text-sm text-dark-300">
+          No rotations yet. Create one to route escalations to a specific user.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {schedules.map((s) => (
+            <div key={s.id} className="p-4 bg-dark-800 border border-dark-500 rounded-lg">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-2">
+                    <span className="font-medium text-dark-50">{s.name}</span>
+                    <span className="px-1.5 py-0.5 rounded text-xs bg-dark-700 text-dark-300">
+                      every {s.cadence_days} day{s.cadence_days === 1 ? "" : "s"}
+                    </span>
+                    {s.current_on_call ? (
+                      <span className="px-1.5 py-0.5 rounded text-xs bg-rust-500/15 text-rust-400">
+                        on-call now: {s.current_on_call.email}
+                      </span>
+                    ) : (
+                      <span className="px-1.5 py-0.5 rounded text-xs bg-dark-700 text-dark-300">
+                        no current member
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex gap-1.5 flex-wrap">
+                    {s.members.map((m, i) => (
+                      <span
+                        key={`${m.id}-${i}`}
+                        className={`px-2 py-0.5 rounded text-xs ${
+                          s.current_on_call?.id === m.id
+                            ? "bg-rust-500/20 text-rust-300"
+                            : "bg-dark-700 text-dark-200"
+                        }`}
+                        title={m.id}
+                      >
+                        {i + 1}. {m.email}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+                <div className="flex gap-1.5 shrink-0">
+                  <button
+                    onClick={() => openEdit(s)}
+                    className="px-2.5 py-1 bg-dark-700 text-dark-100 rounded-lg text-xs hover:bg-dark-600"
+                  >
+                    Edit
+                  </button>
+                  {confirmDelete === s.id ? (
+                    <>
+                      <button
+                        onClick={() => remove(s.id)}
+                        className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-xs hover:bg-danger-600"
+                      >
+                        Confirm
+                      </button>
+                      <button
+                        onClick={() => setConfirmDelete(null)}
+                        className="px-2.5 py-1 bg-dark-700 text-dark-200 rounded-lg text-xs hover:bg-dark-600"
+                      >
+                        Cancel
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmDelete(s.id)}
+                      className="px-2.5 py-1 bg-danger-500/15 text-danger-400 rounded-lg text-xs hover:bg-danger-500/25"
+                    >
+                      Delete
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={closeEdit}>
+          <div className="bg-dark-900 border border-dark-500 rounded-lg max-w-2xl w-full max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+            <div className="px-6 py-4 border-b border-dark-500 flex items-center justify-between">
+              <h3 className="font-medium text-dark-50">
+                {editing.id ? "Edit rotation" : "New rotation"}
+              </h3>
+              <button onClick={closeEdit} className="text-dark-300 hover:text-dark-100 text-xl leading-none">×</button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-6 space-y-4">
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">Name</label>
+                <input
+                  type="text"
+                  value={draftName}
+                  onChange={(e) => setDraftName(e.target.value)}
+                  placeholder="e.g. Primary, Database team"
+                  className="w-full bg-dark-800 border border-dark-500 rounded p-2 text-sm text-dark-100 outline-none focus:border-rust-500/50"
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">
+                  Cadence (days): {draftCadence}
+                </label>
+                <input
+                  type="range"
+                  min={1}
+                  max={90}
+                  value={draftCadence}
+                  onChange={(e) => setDraftCadence(parseInt(e.target.value, 10))}
+                  className="w-full"
+                />
+                <div className="text-xs text-dark-300 mt-1">
+                  Rotation advances every {draftCadence} day{draftCadence === 1 ? "" : "s"}.
+                </div>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-dark-200 mb-1">
+                  Members (ordered — top of list goes first)
+                </label>
+                {draftMembers.length === 0 ? (
+                  <div className="text-xs text-dark-300 mb-2">No members yet — add from the list below.</div>
+                ) : (
+                  <div className="space-y-1 mb-3">
+                    {draftMembers.map((mid, i) => {
+                      const u = users.find((x) => x.id === mid);
+                      return (
+                        <div key={`${mid}-${i}`} className="flex items-center gap-2 bg-dark-800 border border-dark-500 rounded p-2">
+                          <span className="text-xs text-dark-300 w-5">{i + 1}.</span>
+                          <span className="flex-1 text-sm text-dark-100">{u?.email || mid}</span>
+                          <button
+                            onClick={() => moveMember(i, -1)}
+                            disabled={i === 0}
+                            className="px-1.5 py-0.5 text-xs text-dark-200 hover:text-dark-100 disabled:opacity-30"
+                          >▲</button>
+                          <button
+                            onClick={() => moveMember(i, 1)}
+                            disabled={i === draftMembers.length - 1}
+                            className="px-1.5 py-0.5 text-xs text-dark-200 hover:text-dark-100 disabled:opacity-30"
+                          >▼</button>
+                          <button
+                            onClick={() => setDraftMembers(draftMembers.filter((_, idx) => idx !== i))}
+                            className="px-1.5 py-0.5 text-xs text-danger-400 hover:text-danger-300"
+                          >Remove</button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="bg-dark-800 border border-dark-500 rounded p-2 max-h-40 overflow-y-auto">
+                  <div className="text-xs text-dark-300 mb-1">Click to add:</div>
+                  {users.filter((u) => !draftMembers.includes(u.id)).length === 0 ? (
+                    <div className="text-xs text-dark-300">All users are already in the rotation.</div>
+                  ) : (
+                    users
+                      .filter((u) => !draftMembers.includes(u.id))
+                      .map((u) => (
+                        <button
+                          key={u.id}
+                          onClick={() => setDraftMembers([...draftMembers, u.id])}
+                          className="block w-full text-left px-2 py-1 text-sm text-dark-100 hover:bg-dark-700 rounded"
+                        >
+                          {u.email}
+                        </button>
+                      ))
+                  )}
+                </div>
+              </div>
+            </div>
+            <div className="px-6 py-4 border-t border-dark-500 flex justify-end gap-2">
+              <button
+                onClick={closeEdit}
+                className="px-3 py-1.5 bg-dark-700 text-dark-200 hover:bg-dark-600 hover:text-dark-100 border border-dark-500 rounded-lg text-sm"
+              >Cancel</button>
+              <button
+                onClick={save}
+                className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600"
+              >Save</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 W3: Escalation policies editor
+// ---------------------------------------------------------------------------
+
+function PoliciesTab({ onMessage }: { onMessage: (m: { text: string; type: string }) => void }) {
+  const [policies, setPolicies] = useState<EscalationPolicy[]>([]);
+  const [schedules, setSchedules] = useState<OnCallSchedule[]>([]);
+  const [users, setUsers] = useState<MemberInfo[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState<EscalationPolicy | null>(null);
+  const [draftName, setDraftName] = useState("");
+  const [draftSteps, setDraftSteps] = useState<EscalationStep[]>([]);
+  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+
+  const fetchAll = async () => {
+    try {
+      const [p, s, u] = await Promise.all([
+        api.get<EscalationPolicy[]>("/escalation-policies"),
+        api.get<OnCallSchedule[]>("/on-call/schedules"),
+        api.get<{ id: string; email: string }[]>("/users"),
+      ]);
+      setPolicies(p);
+      setSchedules(s);
+      setUsers(u.map((x) => ({ id: x.id, email: x.email })));
+    } catch (e) {
+      logger.error("Failed to load policies:", e);
+      onMessage({ text: "Failed to load escalation policies", type: "error" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchAll();
+  }, []);
+
+  const openNew = () => {
+    setEditing({
+      id: "",
+      name: "",
+      steps: [{ after_minutes: 0, route: "all_channels" }],
+      used_by_rule_count: 0,
+      created_at: "",
+      updated_at: "",
+    });
+    setDraftName("");
+    setDraftSteps([{ after_minutes: 0, route: "all_channels" }]);
+  };
+
+  const openEdit = (p: EscalationPolicy) => {
+    setEditing(p);
+    setDraftName(p.name);
+    setDraftSteps(p.steps);
+  };
+
+  const closeEdit = () => {
+    setEditing(null);
+  };
+
+  const save = async () => {
+    if (!editing) return;
+    if (!draftName.trim()) {
+      onMessage({ text: "Name is required", type: "error" });
+      return;
+    }
+    if (draftSteps.length === 0) {
+      onMessage({ text: "At least one step is required", type: "error" });
+      return;
+    }
+    if (draftSteps[0].after_minutes !== 0) {
+      onMessage({ text: "First step must have after_minutes = 0", type: "error" });
+      return;
+    }
+    for (let i = 1; i < draftSteps.length; i++) {
+      if (draftSteps[i].after_minutes <= draftSteps[i - 1].after_minutes) {
+        onMessage({ text: `Step ${i + 1} must be after step ${i} in minutes`, type: "error" });
+        return;
+      }
+    }
+    try {
+      const body = { name: draftName.trim(), steps: draftSteps };
+      if (editing.id) {
+        await api.put(`/escalation-policies/${editing.id}`, body);
+      } else {
+        await api.post(`/escalation-policies`, body);
+      }
+      onMessage({ text: "Policy saved", type: "success" });
+      closeEdit();
+      fetchAll();
+    } catch (e) {
+      logger.error("Failed to save policy:", e);
+      const detail = (e as { response?: { data?: { error?: string } } })?.response?.data?.error;
+      onMessage({ text: detail || "Failed to save policy", type: "error" });
+    }
+  };
+
+  const remove = async (id: string) => {
+    try {
+      await api.delete(`/escalation-policies/${id}`);
+      onMessage({ text: "Policy deleted", type: "success" });
+      setConfirmDelete(null);
+      fetchAll();
+    } catch (e) {
+      logger.error("Failed to delete policy:", e);
+      onMessage({ text: "Failed to delete policy", type: "error" });
+    }
+  };
+
+  const describeRoute = (route: string): string => {
+    if (route === "all_channels") return "All configured channels (alert owner)";
+    if (route.startsWith("on_call_schedule:")) {
+      const id = route.slice("on_call_schedule:".length);
+      const s = schedules.find((x) => x.id === id);
+      return s ? `On-call schedule: ${s.name}` : `On-call schedule: ${id.slice(0, 8)}…`;
+    }
+    if (route.startsWith("user:")) {
+      const id = route.slice("user:".length);
+      const u = users.find((x) => x.id === id);
+      return u ? `User: ${u.email}` : `User: ${id.slice(0, 8)}…`;
+    }
+    if (route.startsWith("webhook:")) {
+      return `Webhook: ${route.slice("webhook:".length)}`;
+    }
+    return route;
+  };
+
+  return (
+    <div>
+      <div className="bg-dark-800 border border-dark-500 rounded-lg p-4 mb-6">
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div className="min-w-0 max-w-2xl">
+            <h2 className="font-medium text-dark-50 mb-1">Escalation policies</h2>
+            <p className="text-sm text-dark-200">
+              Ordered chain of `(after_minutes, route)` steps. Step 0 fires
+              immediately when an alert is created. Subsequent steps fire if
+              the alert isn't acknowledged by their threshold. Attach a policy
+              to an alert rule from the alert-rules editor; without one, the
+              pre-W3 default of 15-min unack → 30-min re-page applies.
+            </p>
+          </div>
+          <button
+            onClick={openNew}
+            className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600 shrink-0"
+          >
+            New policy
+          </button>
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="space-y-3">
+          {[1, 2].map((i) => (
+            <div key={i} className="h-20 bg-dark-800 rounded-lg animate-pulse" />
+          ))}
+        </div>
+      ) : policies.length === 0 ? (
+        <div className="text-center py-12 text-sm text-dark-300">
+          No policies yet. Create one to chain escalation through on-call rotations.
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {policies.map((p) => (
+            <div key={p.id} className="p-4 bg-dark-800 border border-dark-500 rounded-lg">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap mb-2">
+                    <span className="font-medium text-dark-50">{p.name}</span>
+                    <span className="px-1.5 py-0.5 rounded text-xs bg-dark-700 text-dark-300">
+                      {p.steps.length} step{p.steps.length === 1 ? "" : "s"}
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded text-xs bg-accent-500/10 text-accent-400">
+                      used by {p.used_by_rule_count} rule{p.used_by_rule_count === 1 ? "" : "s"}
+                    </span>
+                  </div>
+                  <ol className="space-y-1 text-sm">
+                    {p.steps.map((step, i) => (
+                      <li key={i} className="text-dark-200">
+                        <span className="text-dark-300 font-mono">+{step.after_minutes}m:</span>{" "}
+                        {describeRoute(step.route)}
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+                <div className="flex gap-1.5 shrink-0">
+                  <button
+                    onClick={() => openEdit(p)}
+                    className="px-2.5 py-1 bg-dark-700 text-dark-100 rounded-lg text-xs hover:bg-dark-600"
+                  >
+                    Edit
+                  </button>
+                  {confirmDelete === p.id ? (
+                    <>
+                      <button
+                        onClick={() => remove(p.id)}
+                        className="px-2.5 py-1 bg-danger-500 text-white rounded-lg text-xs hover:bg-danger-600"
+                      >Confirm</button>
+                      <button
+                        onClick={() => setConfirmDelete(null)}
+                        className="px-2.5 py-1 bg-dark-700 text-dark-200 rounded-lg text-xs hover:bg-dark-600"
+                      >Cancel</button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => setConfirmDelete(p.id)}
+                      className="px-2.5 py-1 bg-danger-500/15 text-danger-400 rounded-lg text-xs hover:bg-danger-500/25"
+                    >
+                      Delete
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && (
+        <PolicyEditModal
+          name={draftName}
+          steps={draftSteps}
+          schedules={schedules}
+          users={users}
+          onNameChange={setDraftName}
+          onStepsChange={setDraftSteps}
+          onClose={closeEdit}
+          onSave={save}
+          isNew={!editing.id}
+        />
+      )}
+    </div>
+  );
+}
+
+function PolicyEditModal({
+  name,
+  steps,
+  schedules,
+  users,
+  onNameChange,
+  onStepsChange,
+  onClose,
+  onSave,
+  isNew,
+}: {
+  name: string;
+  steps: EscalationStep[];
+  schedules: OnCallSchedule[];
+  users: MemberInfo[];
+  onNameChange: (s: string) => void;
+  onStepsChange: (s: EscalationStep[]) => void;
+  onClose: () => void;
+  onSave: () => void;
+  isNew: boolean;
+}) {
+  const updateStep = (i: number, patch: Partial<EscalationStep>) => {
+    const next = steps.map((s, idx) => (idx === i ? { ...s, ...patch } : s));
+    onStepsChange(next);
+  };
+  const addStep = () => {
+    const last = steps[steps.length - 1];
+    const nextMinutes = last ? last.after_minutes + 5 : 0;
+    onStepsChange([...steps, { after_minutes: nextMinutes, route: "all_channels" }]);
+  };
+  const removeStep = (i: number) => {
+    if (i === 0) return; // Step 0 is structural — can't delete.
+    onStepsChange(steps.filter((_, idx) => idx !== i));
+  };
+  const routeKind = (route: string): "all_channels" | "on_call_schedule" | "user" | "webhook" => {
+    if (route === "all_channels") return "all_channels";
+    if (route.startsWith("on_call_schedule:")) return "on_call_schedule";
+    if (route.startsWith("user:")) return "user";
+    return "webhook";
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50" onClick={onClose}>
+      <div className="bg-dark-900 border border-dark-500 rounded-lg max-w-3xl w-full max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+        <div className="px-6 py-4 border-b border-dark-500 flex items-center justify-between">
+          <h3 className="font-medium text-dark-50">
+            {isNew ? "New policy" : "Edit policy"}
+          </h3>
+          <button onClick={onClose} className="text-dark-300 hover:text-dark-100 text-xl leading-none">×</button>
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-dark-200 mb-1">Name</label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => onNameChange(e.target.value)}
+              placeholder="e.g. Critical infra escalation"
+              className="w-full bg-dark-800 border border-dark-500 rounded p-2 text-sm text-dark-100 outline-none focus:border-rust-500/50"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-dark-200 mb-2">Steps (ordered, after_minutes must strictly increase)</label>
+            <div className="space-y-2">
+              {steps.map((step, i) => {
+                const kind = routeKind(step.route);
+                return (
+                  <div key={i} className="bg-dark-800 border border-dark-500 rounded p-3">
+                    <div className="flex items-center gap-3 mb-2">
+                      <span className="text-xs text-dark-300 font-mono w-12">step {i}</span>
+                      <label className="text-xs text-dark-200">After</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={1440}
+                        value={step.after_minutes}
+                        onChange={(e) => updateStep(i, { after_minutes: parseInt(e.target.value, 10) || 0 })}
+                        disabled={i === 0}
+                        className="w-20 bg-dark-700 border border-dark-500 rounded px-2 py-1 text-sm text-dark-100 disabled:opacity-50 outline-none"
+                      />
+                      <span className="text-xs text-dark-300">minutes</span>
+                      {i > 0 && (
+                        <button
+                          onClick={() => removeStep(i)}
+                          className="ml-auto px-2 py-0.5 text-xs text-danger-400 hover:text-danger-300"
+                        >
+                          Remove step
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <select
+                        value={kind}
+                        onChange={(e) => {
+                          const v = e.target.value as "all_channels" | "on_call_schedule" | "user" | "webhook";
+                          if (v === "all_channels") updateStep(i, { route: "all_channels" });
+                          else if (v === "on_call_schedule") updateStep(i, { route: schedules[0] ? `on_call_schedule:${schedules[0].id}` : "all_channels" });
+                          else if (v === "user") updateStep(i, { route: users[0] ? `user:${users[0].id}` : "all_channels" });
+                          else updateStep(i, { route: "webhook:https://" });
+                        }}
+                        className="bg-dark-700 border border-dark-500 rounded text-sm text-dark-100 px-2 py-1"
+                      >
+                        <option value="all_channels">All channels (alert owner)</option>
+                        <option value="on_call_schedule">On-call schedule</option>
+                        <option value="user">Specific user</option>
+                        <option value="webhook">Webhook URL</option>
+                      </select>
+                      {kind === "on_call_schedule" && (
+                        <select
+                          value={step.route.slice("on_call_schedule:".length)}
+                          onChange={(e) => updateStep(i, { route: `on_call_schedule:${e.target.value}` })}
+                          className="bg-dark-700 border border-dark-500 rounded text-sm text-dark-100 px-2 py-1"
+                        >
+                          {schedules.length === 0 ? (
+                            <option value="">— no schedules defined —</option>
+                          ) : (
+                            schedules.map((s) => (
+                              <option key={s.id} value={s.id}>{s.name}</option>
+                            ))
+                          )}
+                        </select>
+                      )}
+                      {kind === "user" && (
+                        <select
+                          value={step.route.slice("user:".length)}
+                          onChange={(e) => updateStep(i, { route: `user:${e.target.value}` })}
+                          className="bg-dark-700 border border-dark-500 rounded text-sm text-dark-100 px-2 py-1"
+                        >
+                          {users.length === 0 ? (
+                            <option value="">— no users —</option>
+                          ) : (
+                            users.map((u) => (
+                              <option key={u.id} value={u.id}>{u.email}</option>
+                            ))
+                          )}
+                        </select>
+                      )}
+                      {kind === "webhook" && (
+                        <input
+                          type="url"
+                          value={step.route.slice("webhook:".length)}
+                          onChange={(e) => updateStep(i, { route: `webhook:${e.target.value}` })}
+                          placeholder="https://hooks.example.com/escalation"
+                          className="flex-1 min-w-[200px] bg-dark-700 border border-dark-500 rounded text-sm text-dark-100 px-2 py-1 outline-none"
+                        />
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+              {steps.length < 10 && (
+                <button
+                  onClick={addStep}
+                  className="px-3 py-1.5 bg-dark-700 text-dark-100 rounded-lg text-sm hover:bg-dark-600"
+                >
+                  + Add step
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+        <div className="px-6 py-4 border-t border-dark-500 flex justify-end gap-2">
+          <button onClick={onClose} className="px-3 py-1.5 bg-dark-700 text-dark-200 hover:bg-dark-600 hover:text-dark-100 border border-dark-500 rounded-lg text-sm">Cancel</button>
+          <button onClick={onSave} className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-sm font-medium hover:bg-rust-600">Save</button>
+        </div>
+      </div>
     </div>
   );
 }

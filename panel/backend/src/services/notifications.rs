@@ -201,15 +201,48 @@ async fn panel_base_url(pool: &PgPool) -> String {
         .unwrap_or_default()
 }
 
+/// Phase 4 W3: build the runbook excerpt + URL pair for a given alert type.
+///
+/// Returns `(None, None)` when no runbook exists (DB row or const default).
+/// Returns `(Some excerpt, Some url)` when the runbook is loadable AND a
+/// `base_url` is configured; `(Some excerpt, None)` when no `base_url` is set
+/// (excerpt still useful for chat/webhook channels, URL omitted).
+///
+/// Used by both `try_fire_alert` (initial page) and
+/// `services::alert_engine::check_escalations` (re-pages on escalation)
+/// so escalation notifications carry the same runbook payload as the
+/// original fire (W2 consistency repair).
+pub async fn load_runbook_payload(
+    pool: &PgPool,
+    alert_type: &str,
+) -> (Option<String>, Option<String>) {
+    let runbook = crate::services::alert_runbooks::get_runbook(pool, alert_type).await;
+    let excerpt = runbook
+        .as_ref()
+        .map(|r| crate::services::alert_runbooks::excerpt(&r.runbook_md, 280));
+    let url = if runbook.is_some() {
+        let base = panel_base_url(pool).await;
+        if base.is_empty() {
+            None
+        } else {
+            Some(format!("{base}/alerts/runbooks/{alert_type}"))
+        }
+    } else {
+        None
+    };
+    (excerpt, url)
+}
+
 /// Phase 4 W2: Send a notification with runbook attachment.
-/// Used by `try_fire_alert` — non-alert callers stay on `send_notification`.
+/// Used by `try_fire_alert` and `check_escalations` (W3) — non-alert
+/// callers stay on `send_notification`.
 ///
 /// Per-channel handling:
 /// - email: full markdown rendered via pulldown-cmark, appended to body_html
 /// - slack/discord: link + 280-char excerpt appended to message
 /// - pagerduty: runbook_url + runbook_excerpt added to custom_details
 /// - webhook: runbook_url + runbook_excerpt as top-level keys
-async fn send_notification_with_runbook(
+pub async fn send_notification_with_runbook(
     pool: &PgPool,
     channels: &NotifyChannels,
     subject: &str,
@@ -471,6 +504,196 @@ pub async fn get_user_channels(
     })
 }
 
+/// Phase 4 W3: look up the escalation_policy_id for a user/server pair.
+/// Mirrors `get_user_channels` row-resolution: server-specific row wins,
+/// global (server_id IS NULL) row is the fallback, no row at all → None.
+pub async fn get_user_policy_id(
+    pool: &PgPool,
+    user_id: Uuid,
+    server_id: Option<Uuid>,
+) -> Option<Uuid> {
+    if let Some(sid) = server_id {
+        let specific: Option<(Option<Uuid>,)> = sqlx::query_as(
+            "SELECT escalation_policy_id FROM alert_rules \
+             WHERE user_id = $1 AND server_id = $2",
+        )
+        .bind(user_id)
+        .bind(sid)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        if let Some((Some(pid),)) = specific {
+            return Some(pid);
+        }
+        // Specific row existed but policy NULL → preserve "no policy"; only
+        // fall back to global when the specific row is absent entirely.
+        if specific.is_some() {
+            return None;
+        }
+    }
+    let global: Option<(Option<Uuid>,)> = sqlx::query_as(
+        "SELECT escalation_policy_id FROM alert_rules \
+         WHERE user_id = $1 AND server_id IS NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    global.and_then(|(p,)| p)
+}
+
+/// Phase 4 W3: load + decode an `escalation_policies` row's `steps` array.
+/// Returns the parsed `Vec<EscalationStep>` or empty vec on any failure.
+pub async fn load_escalation_steps(
+    pool: &PgPool,
+    policy_id: Uuid,
+) -> Vec<crate::models::EscalationStep> {
+    let row: Option<(serde_json::Value,)> = sqlx::query_as(
+        "SELECT steps FROM escalation_policies WHERE id = $1",
+    )
+    .bind(policy_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((steps_json,)) = row else { return Vec::new(); };
+    serde_json::from_value(steps_json).unwrap_or_else(|e| {
+        tracing::warn!("Failed to decode escalation_policy {policy_id} steps: {e}");
+        Vec::new()
+    })
+}
+
+/// Phase 4 W3: dispatch a single escalation step's payload.
+///
+/// Resolves the step's `route` against on-call schedules and user IDs,
+/// then sends `send_notification_with_runbook` for each resolved
+/// channel-set. `alert_owner_id` is the user_id on the alerts row —
+/// used as the fallback "channels of record" for `all_channels` routes
+/// and synthetic-webhook routes.
+pub async fn dispatch_escalation_step(
+    pool: &PgPool,
+    alert_owner_id: Uuid,
+    alert_owner_server_id: Option<Uuid>,
+    alert_type: &str,
+    step: &crate::models::EscalationStep,
+    subject: &str,
+    message: &str,
+    body_html: &str,
+    runbook_excerpt: Option<&str>,
+    runbook_url: Option<&str>,
+) {
+    let route = &step.route;
+    if let Some(url) = route.strip_prefix("webhook:") {
+        // Direct webhook bypass — synthesize a NotifyChannels with only
+        // the webhook_url populated.
+        let synthetic = NotifyChannels {
+            email: None,
+            slack_url: None,
+            discord_url: None,
+            pagerduty_key: None,
+            webhook_url: Some(url.to_string()),
+            muted_types: String::new(),
+        };
+        send_notification_with_runbook(
+            pool,
+            &synthetic,
+            subject,
+            message,
+            body_html,
+            runbook_excerpt,
+            runbook_url,
+        )
+        .await;
+        return;
+    }
+
+    if route == "all_channels" {
+        // Fan out to the alert's owner — preserves pre-W3 default behaviour.
+        fanout_to_user(
+            pool,
+            alert_owner_id,
+            alert_owner_server_id,
+            alert_type,
+            subject,
+            message,
+            body_html,
+            runbook_excerpt,
+            runbook_url,
+        )
+        .await;
+        return;
+    }
+
+    // on_call_schedule:<uuid> or user:<uuid> → routes resolve to user IDs.
+    let users = crate::services::on_call::route_to_user_ids(pool, route).await;
+    if users.is_empty() {
+        tracing::debug!(
+            "dispatch_escalation_step: route {route} resolved to no users (schedule empty? unknown shape?) — skipping page"
+        );
+        return;
+    }
+    for uid in users {
+        fanout_to_user(
+            pool,
+            uid,
+            alert_owner_server_id,
+            alert_type,
+            subject,
+            message,
+            body_html,
+            runbook_excerpt,
+            runbook_url,
+        )
+        .await;
+    }
+}
+
+/// Phase 4 W3: send to one user's channels with that user's own mute
+/// preference applied. Used by `dispatch_escalation_step` to honour the
+/// routed user's per-type mute even when escalation routes them in.
+async fn fanout_to_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    server_id: Option<Uuid>,
+    alert_type: &str,
+    subject: &str,
+    message: &str,
+    body_html: &str,
+    runbook_excerpt: Option<&str>,
+    runbook_url: Option<&str>,
+) {
+    let Some(channels) = get_user_channels(pool, user_id, server_id).await else {
+        return;
+    };
+    let is_muted = if !channels.muted_types.is_empty() {
+        channels
+            .muted_types
+            .split(',')
+            .map(|s| s.trim())
+            .any(|t| t == alert_type)
+    } else {
+        false
+    };
+    if is_muted {
+        tracing::debug!(
+            "Alert type '{alert_type}' muted for routed user {user_id} — skipping external channels"
+        );
+        return;
+    }
+    send_notification_with_runbook(
+        pool,
+        &channels,
+        subject,
+        message,
+        body_html,
+        runbook_excerpt,
+        runbook_url,
+    )
+    .await;
+}
+
 /// Check if an alert type is enabled for a user.
 pub async fn is_alert_enabled(
     pool: &PgPool,
@@ -668,53 +891,40 @@ pub async fn try_fire_alert(
     // Also store in panel notification center (bell icon) — notify all admins
     notify_panel(pool, None, title, message, severity, "alert", None).await;
 
-    // Send notification
-    if let Some(channels) = get_user_channels(pool, user_id, server_id).await {
-        // Gap #69: Check if this alert type is muted from external channels
-        let is_muted = if !channels.muted_types.is_empty() {
-            let muted: Vec<&str> = channels.muted_types.split(',').map(|s| s.trim()).collect();
-            muted.contains(&alert_type)
-        } else {
-            false
-        };
+    // Build the notification payload once — both the NULL-policy fan-out and the
+    // policy-driven fan-out reuse it.
+    let subject = format!("DockPanel Alert: {title}");
+    let html = format!(
+        "<div style=\"font-family:sans-serif;max-width:600px;margin:0 auto\">\
+         <h2 style=\"color:{}\">{title}</h2>\
+         <p>{message}</p>\
+         <p style=\"color:#6b7280;font-size:14px\">Time: {}</p>\
+         </div>",
+        match severity {
+            "critical" => "#ef4444",
+            "warning" => "#f59e0b",
+            _ => "#3b82f6",
+        },
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+    );
+    // Phase 4 W2 + W3: attach runbook to the notification payload.
+    // Same helper is reused by check_escalations so escalation re-pages
+    // carry the runbook excerpt + URL too.
+    let (runbook_excerpt, runbook_url) = load_runbook_payload(pool, alert_type).await;
 
-        if !is_muted {
-            let subject = format!("DockPanel Alert: {title}");
-            let html = format!(
-                "<div style=\"font-family:sans-serif;max-width:600px;margin:0 auto\">\
-                 <h2 style=\"color:{}\">{title}</h2>\
-                 <p>{message}</p>\
-                 <p style=\"color:#6b7280;font-size:14px\">Time: {}</p>\
-                 </div>",
-                match severity {
-                    "critical" => "#ef4444",
-                    "warning" => "#f59e0b",
-                    _ => "#3b82f6",
-                },
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-            );
-
-            // Phase 4 W2: attach runbook to the notification payload.
-            // Excerpt goes to slack/discord/pagerduty/webhook + email body.
-            // URL is built from base_url setting; falls back to empty if unset.
-            let runbook = crate::services::alert_runbooks::get_runbook(pool, alert_type).await;
-            let runbook_excerpt = runbook
-                .as_ref()
-                .map(|r| crate::services::alert_runbooks::excerpt(&r.runbook_md, 280));
-            let runbook_url = if runbook.is_some() {
-                let base = panel_base_url(pool).await;
-                if base.is_empty() {
-                    None
-                } else {
-                    Some(format!("{base}/alerts/runbooks/{alert_type}"))
-                }
-            } else {
-                None
-            };
-
-            send_notification_with_runbook(
+    // Phase 4 W3: if the alert_rules row attaches an escalation policy,
+    // page only the channels routed by step 0 (e.g. the current on-call
+    // user). NULL policy_id preserves the pre-W3 behaviour exactly.
+    let policy_id = get_user_policy_id(pool, user_id, server_id).await;
+    if let Some(pid) = policy_id {
+        let steps = load_escalation_steps(pool, pid).await;
+        if let Some(step0) = steps.first() {
+            dispatch_escalation_step(
                 pool,
-                &channels,
+                user_id,
+                server_id,
+                alert_type,
+                step0,
                 &subject,
                 message,
                 &html,
@@ -722,10 +932,27 @@ pub async fn try_fire_alert(
                 runbook_url.as_deref(),
             )
             .await;
-        } else {
-            tracing::debug!("Alert type '{alert_type}' is muted — skipping external channels");
+            return Ok(());
         }
+        tracing::warn!(
+            "Alert rule references escalation_policy {pid} with empty/invalid steps — falling back to default channel fan-out"
+        );
     }
+
+    // NULL policy (or fallback for malformed policy) → pre-W3 behaviour:
+    // page the alert owner's channels with their own mute prefs applied.
+    fanout_to_user(
+        pool,
+        user_id,
+        server_id,
+        alert_type,
+        &subject,
+        message,
+        &html,
+        runbook_excerpt.as_deref(),
+        runbook_url.as_deref(),
+    )
+    .await;
 
     Ok(())
 }

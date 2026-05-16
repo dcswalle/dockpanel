@@ -1160,14 +1160,39 @@ async fn check_container_health(pool: &PgPool, agent: &AgentClient) {
 
 // ─── GAP 9: Alert Escalation ────────────────────────────────────────────
 
-/// Re-notify for unacknowledged firing alerts older than 15 minutes.
-/// Escalation repeats every 30 minutes until the alert is acknowledged or resolved.
+/// Re-notify for unacknowledged firing alerts.
+///
+/// Phase 4 W3: two paths.
+/// - When the owning `alert_rules` row has `escalation_policy_id IS NULL`, the
+///   pre-W3 behaviour is preserved exactly: re-page every 30 min for alerts
+///   older than 15 min. The W3 ship also folds in the W2 runbook payload here
+///   — bare `send_notification` was leaving the runbook excerpt + URL out of
+///   escalation pages even though `try_fire_alert` carried them on the
+///   original fire.
+/// - When `escalation_policy_id IS NOT NULL`, the policy chain drives
+///   `(after_minutes, route)` steps. Each minute we advance to the highest
+///   step whose `after_minutes <= alert age` AND whose index is strictly
+///   greater than `alerts.escalation_step_index`. Once the last step has
+///   fired we never re-page until the operator acks/resolves the alert.
 async fn check_escalations(pool: &PgPool) {
-    let escalated: Vec<(Uuid, Uuid, String, String)> = match sqlx::query_as(
-        "SELECT id, user_id, title, message FROM alerts \
-         WHERE status = 'firing' AND acknowledged_at IS NULL \
-         AND created_at < NOW() - INTERVAL '15 minutes' \
-         AND (escalated_at IS NULL OR escalated_at < NOW() - INTERVAL '30 minutes')",
+    #[derive(sqlx::FromRow)]
+    struct EscalationRow {
+        id: Uuid,
+        user_id: Uuid,
+        server_id: Option<Uuid>,
+        alert_type: String,
+        title: String,
+        message: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        escalation_step_index: i32,
+        escalated_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+
+    let rows: Vec<EscalationRow> = match sqlx::query_as(
+        "SELECT id, user_id, server_id, alert_type, title, message, \
+                created_at, escalation_step_index, escalated_at \
+         FROM alerts \
+         WHERE status = 'firing' AND acknowledged_at IS NULL",
     )
     .fetch_all(pool)
     .await
@@ -1179,31 +1204,133 @@ async fn check_escalations(pool: &PgPool) {
         }
     };
 
-    for (alert_id, user_id, title, message) in &escalated {
-        let esc_subject = format!("[ESCALATED] {}", title);
+    let now = chrono::Utc::now();
 
-        // Send escalated notification via user's configured channels
-        if let Some(channels) = notifications::get_user_channels(pool, *user_id, None).await {
-            let html = format!(
-                "<div style=\"font-family:sans-serif;max-width:600px;margin:0 auto\">\
-                 <h2 style=\"color:#ef4444\">[ESCALATED] {}</h2>\
-                 <p>{}</p>\
-                 <p style=\"color:#ef4444;font-weight:bold\">This alert has not been acknowledged. Please investigate immediately.</p>\
-                 <p style=\"color:#6b7280;font-size:14px\">Time: {}</p>\
-                 </div>",
-                title,
-                message,
-                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-            );
-            notifications::send_notification(pool, &channels, &esc_subject, message, &html).await;
+    for row in &rows {
+        let policy_id =
+            notifications::get_user_policy_id(pool, row.user_id, row.server_id).await;
+        let (runbook_excerpt, runbook_url) =
+            notifications::load_runbook_payload(pool, &row.alert_type).await;
+
+        let esc_subject = format!("[ESCALATED] {}", row.title);
+        let html = format!(
+            "<div style=\"font-family:sans-serif;max-width:600px;margin:0 auto\">\
+             <h2 style=\"color:#ef4444\">[ESCALATED] {}</h2>\
+             <p>{}</p>\
+             <p style=\"color:#ef4444;font-weight:bold\">This alert has not been acknowledged. Please investigate immediately.</p>\
+             <p style=\"color:#6b7280;font-size:14px\">Time: {}</p>\
+             </div>",
+            row.title,
+            row.message,
+            now.format("%Y-%m-%d %H:%M:%S UTC"),
+        );
+
+        match policy_id {
+            None => {
+                // Pre-W3 default cadence: 15 min unack threshold, 30 min re-page.
+                let age = now - row.created_at;
+                if age < chrono::Duration::minutes(15) {
+                    continue;
+                }
+                if let Some(escalated_at) = row.escalated_at {
+                    if now - escalated_at < chrono::Duration::minutes(30) {
+                        continue;
+                    }
+                }
+
+                // Fan out via the alert owner's channels — same audience as
+                // try_fire_alert's NULL-policy path. dispatch_escalation_step
+                // handles per-user mute checks and (W2 repair) carries the
+                // runbook payload.
+                let step = crate::models::EscalationStep {
+                    after_minutes: 0,
+                    route: "all_channels".to_string(),
+                };
+                notifications::dispatch_escalation_step(
+                    pool,
+                    row.user_id,
+                    row.server_id,
+                    &row.alert_type,
+                    &step,
+                    &esc_subject,
+                    &row.message,
+                    &html,
+                    runbook_excerpt.as_deref(),
+                    runbook_url.as_deref(),
+                )
+                .await;
+
+                let _ = sqlx::query("UPDATE alerts SET escalated_at = $1 WHERE id = $2")
+                    .bind(now)
+                    .bind(row.id)
+                    .execute(pool)
+                    .await;
+
+                tracing::info!(
+                    "Escalated unacknowledged alert (default cadence): {}",
+                    row.title
+                );
+            }
+            Some(pid) => {
+                let steps = notifications::load_escalation_steps(pool, pid).await;
+                if steps.is_empty() {
+                    tracing::warn!(
+                        "Alert {} references escalation_policy {pid} with empty steps; skipping",
+                        row.id
+                    );
+                    continue;
+                }
+
+                let elapsed_minutes = (now - row.created_at).num_minutes();
+                let current_index = row.escalation_step_index as usize;
+
+                // Find the highest step whose index > current_index and whose
+                // after_minutes <= elapsed_minutes. Once exhausted, terminal —
+                // do nothing this tick. Iterate from the end so we jump to the
+                // furthest-eligible step on each tick rather than walking one
+                // step at a time.
+                let mut next_idx: Option<usize> = None;
+                for (i, step) in steps.iter().enumerate().rev() {
+                    if i <= current_index {
+                        break;
+                    }
+                    if step.after_minutes as i64 <= elapsed_minutes {
+                        next_idx = Some(i);
+                        break;
+                    }
+                }
+
+                let Some(i) = next_idx else { continue };
+                let step = &steps[i];
+
+                notifications::dispatch_escalation_step(
+                    pool,
+                    row.user_id,
+                    row.server_id,
+                    &row.alert_type,
+                    step,
+                    &esc_subject,
+                    &row.message,
+                    &html,
+                    runbook_excerpt.as_deref(),
+                    runbook_url.as_deref(),
+                )
+                .await;
+
+                let _ = sqlx::query(
+                    "UPDATE alerts SET escalation_step_index = $1, escalated_at = $2 WHERE id = $3",
+                )
+                .bind(i as i32)
+                .bind(now)
+                .bind(row.id)
+                .execute(pool)
+                .await;
+
+                tracing::info!(
+                    "Escalated alert (policy {pid} step {i}): {}",
+                    row.title
+                );
+            }
         }
-
-        // Mark escalation timestamp so we don't re-escalate for another 30 minutes
-        let _ = sqlx::query("UPDATE alerts SET escalated_at = NOW() WHERE id = $1")
-            .bind(alert_id)
-            .execute(pool)
-            .await;
-
-        tracing::info!("Escalated unacknowledged alert: {}", title);
     }
 }

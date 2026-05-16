@@ -6,6 +6,68 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-05-16
+
+Phase 4 W3 ships **on-call rotations** and **escalation policies**. A small
+team can now self-host their on-call schedule in DockPanel — when an alert
+fires, the panel pages whoever is on-call right now (not every channel on
+the rule); if the alert isn't acknowledged within a policy-defined
+threshold, the panel routes the page to the next step in the chain.
+
+Larger teams that already pay for PagerDuty keep using PagerDuty — the
+escalation policy supports a `webhook:<url>` route shape that forwards
+directly into their existing PD service key.
+
+### Added
+
+- **`on_call_schedules` table + admin tab.** A rotation = ordered list of
+  user IDs plus a cadence in days (1–90). "Who's on-call at time T" is
+  one-liner cadence math against an anchor; no calendar widget, no
+  per-day overrides, no holiday handling. New endpoints
+  `GET/POST/PUT/DELETE /api/on-call/schedules[/{id}]` (admin) and
+  `GET /api/on-call/whoami` (any authenticated user) for "am I on the
+  hook right now?"
+- **`escalation_policies` table + admin tab.** Policies are an ordered
+  JSONB array of `{after_minutes, route}` steps. Routes are
+  discriminated: `on_call_schedule:<uuid>` resolves to the current
+  rotation holder, `user:<uuid>` pages a specific user, `all_channels`
+  preserves the pre-W3 default (alert owner's channels),
+  `webhook:<url>` is a direct outbound webhook bypass. New endpoints
+  `GET/POST/PUT/DELETE /api/escalation-policies[/{id}]` (admin).
+- **Per-alert-rule policy attachment.** `alert_rules` gains a nullable
+  `escalation_policy_id` FK. NULL = pre-W3 hardcoded 15-min unack →
+  30-min re-page (unchanged for every existing rule). Admin-only attach
+  endpoint at `PUT /api/alert-rules/{rule_id}/escalation-policy`.
+- **Ack actor + optional comment.** `PUT /api/alerts/{id}/acknowledge`
+  now accepts an optional `{ "comment": "..." }` body (500-char cap)
+  and stores both `acknowledged_by` (the actor) and
+  `acknowledged_comment`. Older clients that PUT with no body keep
+  working — they just don't carry a comment. The UI surfaces actor
+  email + truncated comment inline on each acked alert row.
+- **Frontend tabs.** Alerts page grows two new tabs alongside Alerts +
+  Runbooks: an On-call editor (rotation CRUD with reorderable member
+  list) and an Escalation policies editor (step chain with route picker
+  + live route description).
+
+### Changed
+
+- **Escalation pages now carry the runbook payload.** Phase 4 W2 added
+  the runbook excerpt + URL to fire payloads via
+  `send_notification_with_runbook`, but `check_escalations` was still
+  calling bare `send_notification` — so re-pages on unacknowledged
+  alerts lost the runbook context that the original fire had carried.
+  The W3 rewrite of `check_escalations` extracts the shared
+  `load_runbook_payload` helper so fire and escalation paths produce
+  identical payloads.
+
+### Migration
+
+No manual action is required. `escalation_policy_id` is added to
+`alert_rules` as a nullable FK with default NULL — every existing rule
+keeps its pre-W3 behaviour bit-for-bit. The three new alerts columns
+(`acknowledged_by`, `acknowledged_comment`, `escalation_step_index`)
+default to NULL/0 on existing rows.
+
 ## [2.8.23] - 2026-05-16
 
 ### Changed
