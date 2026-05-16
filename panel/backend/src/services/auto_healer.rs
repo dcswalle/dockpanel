@@ -831,6 +831,16 @@ async fn run_retention_cleanup(pool: &PgPool) {
     // GAP 33: Weekly digest — send summary email on Mondays during cleanup cycle
     send_weekly_digest(pool).await;
 
+    // Phase 4 W4: panel snapshot retention. Always-keep last 3, deletes
+    // anything older than 7 days beyond that floor. File-deletes first;
+    // DB row only deleted if file removal succeeded (retries next sweep
+    // otherwise). See `services::panel_snapshot::retention_sweep`.
+    match crate::services::panel_snapshot::retention_sweep(pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!("Retention: removed {n} aged panel snapshot(s)"),
+        Err(e) => tracing::warn!("Retention cleanup (panel_snapshots) failed: {e}"),
+    }
+
     // GAP 67: Read configurable retention periods from settings (fall back to defaults)
     let settings: Vec<(String, String)> = sqlx::query_as(
         "SELECT key, value FROM settings WHERE key LIKE 'retention_%'"

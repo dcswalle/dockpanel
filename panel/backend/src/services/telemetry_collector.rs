@@ -15,8 +15,10 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(3600); // 1 hour
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(21600); // 6 hours
 const RETENTION_DAYS: i64 = 30;
 const MAX_BATCH_SIZE: i64 = 50;
-const GITHUB_RELEASES_URL: &str =
+const GITHUB_RELEASES_LATEST_URL: &str =
     "https://api.github.com/repos/ovexro/dockpanel/releases/latest";
+const GITHUB_RELEASES_LIST_URL: &str =
+    "https://api.github.com/repos/ovexro/dockpanel/releases?per_page=20";
 
 /// Record a telemetry event (callable from anywhere in the backend).
 pub async fn record_event(
@@ -298,14 +300,66 @@ pub fn strip_pii(context: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Check GitHub Releases for a newer version.
+/// Read `update_channel` from settings. Defaults to `"stable"` when the
+/// row is missing or the value is unrecognised (degrades gracefully).
+async fn read_update_channel(pool: &PgPool) -> String {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT value FROM settings WHERE key = 'update_channel'")
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    let value = row.map(|r| r.0).unwrap_or_default();
+    match value.as_str() {
+        "stable" | "candidate" | "hold" => value,
+        _ => "stable".to_string(),
+    }
+}
+
+/// Check GitHub Releases for a newer version, honouring the
+/// `update_channel` setting:
+///   - `stable`    → /releases/latest (excludes prereleases, current default)
+///   - `candidate` → /releases?per_page=20, first by published_at desc
+///                   (includes prereleases — pre-W4 GA releases AND RC
+///                   builds when CI starts tagging `prerelease: true`)
+///   - `hold`      → skip the poll entirely (operator pinned)
+///
+/// The manual-check route bypasses the `hold` skip by calling
+/// [`check_for_updates_manual`] instead.
 async fn check_for_updates(pool: &PgPool) {
+    let channel = read_update_channel(pool).await;
+    if channel == "hold" {
+        tracing::debug!("Update poll skipped: channel=hold");
+        return;
+    }
+    check_for_updates_inner(pool, &channel).await;
+}
+
+/// Bypass the `hold` skip — operator manually clicked "Check now".
+/// Always polls regardless of channel; uses channel only to choose URL.
+pub async fn check_for_updates_manual(pool: &PgPool) {
+    let mut channel = read_update_channel(pool).await;
+    if channel == "hold" {
+        channel = "stable".into(); // manual check defaults to stable scan
+    }
+    check_for_updates_inner(pool, &channel).await;
+}
+
+async fn check_for_updates_inner(pool: &PgPool, channel: &str) {
+    let url = match channel {
+        "candidate" => GITHUB_RELEASES_LIST_URL,
+        _ => GITHUB_RELEASES_LATEST_URL,
+    };
+
     let client = reqwest::Client::new();
     let result = tokio::time::timeout(
         Duration::from_secs(15),
         client
-            .get(GITHUB_RELEASES_URL)
-            .header("User-Agent", format!("DockPanel/{}", env!("CARGO_PKG_VERSION")))
+            .get(url)
+            .header(
+                "User-Agent",
+                format!("DockPanel/{}", env!("CARGO_PKG_VERSION")),
+            )
             .header("Accept", "application/vnd.github+json")
             .send(),
     )
@@ -332,8 +386,21 @@ async fn check_for_updates(pool: &PgPool) {
         Err(_) => return,
     };
 
-    let release: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
+    // Candidate channel returns an ARRAY of releases; stable channel
+    // returns a SINGLE release object. Unify by always working on a
+    // single-release `serde_json::Value`.
+    let release: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(v) => match channel {
+            "candidate" => {
+                // Take first by published_at desc. GitHub returns the
+                // list pre-sorted that way already.
+                match v.as_array().and_then(|arr| arr.first()) {
+                    Some(first) => first.clone(),
+                    None => return, // no releases yet (e.g. fresh repo)
+                }
+            }
+            _ => v,
+        },
         Err(_) => return,
     };
 
@@ -351,12 +418,28 @@ async fn check_for_updates(pool: &PgPool) {
         )
         .execute(pool)
         .await;
+        // Still record the check timestamp so the UI can show "checked Xs ago"
+        let _ = sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('update_checked_at', $1) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await;
         return;
     }
 
     // Simple semver comparison (works for X.Y.Z format)
     let is_newer = compare_versions(latest_version, current_version);
     if !is_newer {
+        // Also record the check timestamp so the UI updates even on no-op polls
+        let _ = sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('update_checked_at', $1) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(chrono::Utc::now().to_rfc3339())
+        .execute(pool)
+        .await;
         return;
     }
 
@@ -401,7 +484,7 @@ async fn check_for_updates(pool: &PgPool) {
     .await;
 
     tracing::info!(
-        "DockPanel update available: v{current_version} -> v{latest_version}"
+        "DockPanel update available ({channel} channel): v{current_version} -> v{latest_version}"
     );
 }
 

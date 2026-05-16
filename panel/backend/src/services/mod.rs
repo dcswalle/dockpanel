@@ -18,6 +18,8 @@ pub mod metrics_collector;
 pub mod prometheus_exporter;
 pub mod notifications;
 pub mod on_call;
+pub mod panel_snapshot;
+pub mod panel_update;
 pub mod secrets_crypto;
 pub mod security_scanner;
 pub mod server_monitor;

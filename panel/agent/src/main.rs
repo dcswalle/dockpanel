@@ -160,6 +160,7 @@ async fn main() {
         .merge(routes::services::router())
         .merge(routes::iac::router())
         .merge(routes::updates::router())
+        .merge(routes::panel_update::router())
         .merge(routes::diagnostics::router())
         .merge(routes::mail::router())
         .merge(routes::migration::router())

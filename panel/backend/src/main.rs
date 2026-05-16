@@ -57,6 +57,11 @@ pub struct AppState {
     pub deploy_owners: Arc<Mutex<HashMap<uuid::Uuid, uuid::Uuid>>>,
     /// WebAuthn/Passkey challenge store (in-memory, 5-minute TTL).
     pub passkey_challenges: routes::passkeys::ChallengeStore,
+    /// Phase 4 W4: panel self-update orchestrator state. Read by
+    /// `/api/update/status`; written by `start_panel_update`. In-process
+    /// only — DB rows in `panel_snapshots` are the durable cross-restart
+    /// signal (the api process dies mid-binary-swap).
+    pub panel_update_state: services::panel_update::UpdateStateHandle,
 }
 
 #[tokio::main]
@@ -239,7 +244,14 @@ async fn main() {
         sessions_revoked_at,
         deploy_owners: Arc::new(Mutex::new(HashMap::new())),
         passkey_challenges: routes::passkeys::new_challenge_store(),
+        panel_update_state: services::panel_update::new_state_handle(),
     };
+
+    // Phase 4 W4: close out any in-flight panel-update rows from a previous
+    // process lifetime. If a snapshot row exists with to_version IS NULL and
+    // we just booted, the prior api crashed/was killed mid-update; write
+    // to_version = CARGO_PKG_VERSION so the UI shows succeeded vs rolled-back.
+    services::panel_update::finalize_pending_on_startup(&state.db).await;
 
     // Shutdown broadcast channel — all background services listen for this signal
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);

@@ -6,6 +6,109 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.10.0] - 2026-05-16
+
+Phase 4 W4 ships **panel self-update from the UI** with health-check
+rollback, **persistent snapshots**, **update channels** (stable /
+candidate / hold), and **fleet rolling updates**.
+
+The reframing matters: `scripts/update.sh:430-499` already ships a
+production-tested binary-swap + .bak-restore rollback flow. v2.10.0 does
+NOT reimplement that — the new orchestrator (`services/panel_update.rs`)
+shells out to the same script under a controlled environment
+(`DOCKPANEL_NO_SELF_REFRESH=1` + `DOCKPANEL_VERSION=<target>`) so every
+bug fix already in update.sh (self-refresh ordering from v2.8.15-16,
+lock-wait conf from v2.8.17, fragment-include awk migration from v2.8.22,
+ACME cooldown from v2.8.23) keeps working unchanged. The new code is a
+presentation + persistence layer over a proven core.
+
+### Added
+- **Apply Update button in Telemetry → Updates tab.** Click → confirm
+  modal showing target version + 4-step preview ("snapshot, download,
+  swap, probe") → status modal that polls `/api/update/status` every 2s.
+  Replaces the static SSH copy-paste block.
+- **Pre-update snapshot service** (`services/panel_snapshot.rs`). Each
+  Apply call first writes a tar.gz triplet to
+  `/var/backups/dockpanel/snapshots/` containing
+  `binaries/{agent,api,cli}` + `db/dump.sql.gz`
+  (`pg_dump --clean --if-exists`) + `etc/dockpanel/` + `metadata.json`.
+  Written to `.tmp` then atomically renamed; DB row only inserted after
+  rename succeeds. Refuses to create when the snapshot partition has
+  less than 2 GiB free.
+- **Operator-triggered rollback from the UI.** Each snapshot row has a
+  Roll back button (confirms then restores binaries + DB + /etc and
+  bounces services). Reach back to any retained snapshot, not just the
+  `.bak` that `update.sh` keeps for ~30 seconds.
+- **Update channels:** stable (GA only — current default behaviour),
+  candidate (includes `prerelease: true` builds, takes the first by
+  `published_at` desc), hold (skips the 6h auto-poll entirely; Manual
+  Check button still works). Channel selector in Updates tab, single
+  `settings.update_channel` row.
+- **Fleet rolling update.** Operator-initiated form in Updates tab:
+  target version + halt-on-failure + include-panel toggles. Plan = all
+  user-owned remote servers reachable in the last 5 minutes, sorted
+  oldest agent_version first. POSTs to each agent's new `/panel/update`
+  endpoint, polls `/panel/update/status` for terminal state, records
+  per-server progress in `fleet_update_runs.progress` JSONB. Halts on
+  first failure unless `halt_on_failure: false`.
+- **Agent-side `/panel/update` receiver**
+  (`panel/agent/src/routes/panel_update.rs`). Distinct from the existing
+  OS-package `/system/updates/*` endpoints. Bearer-auth, returns 202,
+  spawns `update.sh` detached so the agent's own systemctl restart
+  doesn't break the subprocess pipeline.
+- **10 new admin endpoints** under `/api/update/*` + `/api/snapshots/*`:
+  GET `/status`, POST `/apply`, POST `/manual-check`, POST `/rollback`,
+  GET+PUT `/channel`, GET+POST `/api/snapshots`, DELETE
+  `/api/snapshots/{id}`, GET+POST `/update/fleet`, GET
+  `/update/fleet/{id}`. All admin-gated.
+- **Snapshot retention sweep** wired into the existing 24h
+  `run_retention_cleanup` ticker in `auto_healer.rs`. Always-keep last 3
+  snapshots regardless of age; delete anything older than 7 days beyond
+  that floor. File-delete first; DB row stays for retry if the file
+  delete fails.
+- **Startup finalize hook** (`finalize_pending_on_startup` in
+  `services/panel_update.rs`). Closes out any `panel_snapshots` rows
+  with `to_version IS NULL` after a process restart by writing
+  `to_version = CARGO_PKG_VERSION`. Equal `from_version`/`to_version`
+  on a finalized row indicates `update.sh`'s in-flight rollback fired;
+  differing values indicate a successful apply.
+
+### Changed
+- **Update poller honours `update_channel`**
+  (`services/telemetry_collector.rs:302`). `hold` skips the poll;
+  `candidate` widens to `/releases?per_page=20` (first by `published_at`
+  desc); `stable` keeps the existing `/releases/latest` URL bit-for-bit.
+- **`scripts/update.sh` accepts two new env vars.**
+  `DOCKPANEL_NO_SELF_REFRESH=1` bypasses the v2.7.13 self-refresh block
+  so the orchestrator can stream a single subprocess invocation's stdout
+  into its state machine without a mid-flight re-exec breaking the pipe
+  (SSH-operator flow keeps self-refresh on by default).
+  `DOCKPANEL_VERSION=vX.Y.Z` pins the release tag instead of fetching
+  `/releases/latest`, so a candidate-channel pick can't race a GA
+  publish between the panel's poll and the operator's click.
+
+### Migration
+- One settings row inserted (`update_channel = 'stable'` — the implicit
+  pre-W4 default). Two new empty tables (`panel_snapshots`,
+  `fleet_update_runs`). No ALTER on existing tables; every install keeps
+  current behaviour until an admin clicks Apply or changes the channel.
+  Migration file: `20260520000000_panel_self_update.sql`.
+
+### Operator notes
+- Snapshots consume disk: ~150-300 MB each typical, retained 7 days
+  (last 3 always kept). Stored under `/var/backups/dockpanel/snapshots/`.
+  A free-disk pre-check refuses to create a snapshot if the partition
+  has less than 2 GiB free.
+- `update.sh`'s SSH-only flow continues working unchanged — no
+  operator forced to use the UI.
+- Cosign signature verification at download time is **not** in W4.
+  HTTPS-to-GitHub is the existing trust boundary; cosign verify is a
+  separate hardening pass (non-trivial key management).
+- The api process will be killed mid-binary-swap by `update.sh`'s
+  `systemctl stop dockpanel-api`. The orchestrator state lives in the
+  DB rows (`panel_snapshots.to_version`); the new process boots Idle
+  and the finalize hook closes out the in-flight row.
+
 ## [2.9.0] - 2026-05-16
 
 Phase 4 W3 ships **on-call rotations** and **escalation policies**. A small

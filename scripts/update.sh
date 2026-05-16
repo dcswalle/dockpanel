@@ -77,7 +77,12 @@ fi
 # v2.7.13 — strands operators unable to upgrade. Pull the latest script
 # from the latest release tag and re-exec ourselves before running any
 # update logic. SELF_REFRESHED=1 prevents an infinite re-exec loop.
-if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ]; then
+# DOCKPANEL_NO_SELF_REFRESH=1 — set by the panel-internal orchestrator
+# (services/panel_update.rs) so it can stream a single update.sh invocation's
+# stdout into its state machine without a mid-flight re-exec breaking the pipe.
+# SSH-operator flow keeps self-refresh on by default.
+if [ "${SELF_REFRESHED:-0}" != "1" ] && [ "$INSTALL_FROM_RELEASE" = "1" ] \
+   && [ "${DOCKPANEL_NO_SELF_REFRESH:-0}" != "1" ]; then
     LATEST_TAG=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
         | grep -m1 '"tag_name"' | cut -d'"' -f4 || true)
     if [ -n "$LATEST_TAG" ]; then
@@ -157,13 +162,23 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
         *) error "Unsupported architecture: $ARCH"; exit 1 ;;
     esac
 
-    log "Fetching latest release..."
-    RELEASE_TAG=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-    if [ -z "$RELEASE_TAG" ]; then
-        error "Could not determine latest release. Check https://github.com/${GITHUB_REPO}/releases"
-        exit 1
+    # DOCKPANEL_VERSION=vX.Y.Z (or vX.Y.Z-rc.N) — pin to a specific release
+    # tag instead of /releases/latest. Lets the panel-internal orchestrator
+    # honour the operator's candidate-channel pick and the in-process
+    # "available version" snapshot, instead of racing /releases/latest mid-
+    # apply (which could shift to a newer GA between poll and click).
+    if [ -n "${DOCKPANEL_VERSION:-}" ]; then
+        RELEASE_TAG="$DOCKPANEL_VERSION"
+        log "Pinned release: $RELEASE_TAG (DOCKPANEL_VERSION)"
+    else
+        log "Fetching latest release..."
+        RELEASE_TAG=$(curl -sf "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+        if [ -z "$RELEASE_TAG" ]; then
+            error "Could not determine latest release. Check https://github.com/${GITHUB_REPO}/releases"
+            exit 1
+        fi
+        log "Latest release: $RELEASE_TAG"
     fi
-    log "Latest release: $RELEASE_TAG"
     BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
 
     log "Downloading agent (${DL_ARCH})..."

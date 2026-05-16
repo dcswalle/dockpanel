@@ -31,6 +31,56 @@ interface TelemetryConfig {
   update_checked_at?: string;
 }
 
+// Phase 4 W4: panel self-update.
+interface PanelSnapshotRow {
+  id: string;
+  file_path: string;
+  from_version: string;
+  to_version: string | null;
+  trigger: string;
+  operator: string | null;
+  size_bytes: number;
+  sha256: string;
+  rolled_back_at: string | null;
+  created_at: string;
+}
+
+type UpdateStateName = "idle" | "in_flight" | "succeeded" | "rolled_back" | "failed";
+
+interface UpdateStateView {
+  state: UpdateStateName;
+  target_version?: string;
+  snapshot_id?: string;
+  started_at?: string;
+  last_log_line?: string | null;
+  from_version?: string;
+  to_version?: string;
+  attempted_version?: string;
+  completed_at?: string;
+  reason?: string;
+  at?: string;
+  current_version: string;
+  available_version?: string | null;
+  channel: string;
+}
+
+interface FleetRunRow {
+  id: string;
+  target_version: string;
+  plan: { server_id: string; name: string; agent_version?: string | null }[];
+  progress: {
+    server_id: string;
+    status: string;
+    duration_ms?: number | null;
+    error?: string | null;
+  }[];
+  halt_on_failure: boolean;
+  include_panel: boolean;
+  started_at: string;
+  finished_at?: string | null;
+  outcome?: string | null;
+}
+
 function safeHttpUrl(url: string | undefined): string | null {
   if (!url) return null;
   return /^https:\/\/[a-z0-9.-]+\//i.test(url) ? url : null;
@@ -79,7 +129,48 @@ export default function Telemetry() {
   const [checking, setChecking] = useState(false);
   const [clearing, setClearing] = useState(false);
 
+  // Phase 4 W4: panel self-update state.
+  const [updateState, setUpdateState] = useState<UpdateStateView | null>(null);
+  const [snapshots, setSnapshots] = useState<PanelSnapshotRow[]>([]);
+  const [applyConfirm, setApplyConfirm] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [showApplyProgress, setShowApplyProgress] = useState(false);
+  const [rollbackConfirm, setRollbackConfirm] = useState<string | null>(null);
+  const [rollingBack, setRollingBack] = useState(false);
+  const [savingChannel, setSavingChannel] = useState(false);
+  const [creatingSnapshot, setCreatingSnapshot] = useState(false);
+  const [fleetVersion, setFleetVersion] = useState("");
+  const [fleetHalt, setFleetHalt] = useState(true);
+  const [fleetIncludePanel, setFleetIncludePanel] = useState(false);
+  const [fleetSubmitting, setFleetSubmitting] = useState(false);
+  const [fleetRuns, setFleetRuns] = useState<FleetRunRow[]>([]);
+
   const limit = 25;
+
+  const loadUpdateState = async () => {
+    try {
+      const data = await api.get<UpdateStateView>("/update/status");
+      setUpdateState(data);
+    } catch {
+      // empty — telemetry tab still works if status is unreachable
+    }
+  };
+  const loadSnapshots = async () => {
+    try {
+      const data = await api.get<PanelSnapshotRow[]>("/snapshots");
+      setSnapshots(data || []);
+    } catch {
+      // empty
+    }
+  };
+  const loadFleetRuns = async () => {
+    try {
+      const data = await api.get<FleetRunRow[]>("/update/fleet");
+      setFleetRuns(data || []);
+    } catch {
+      // empty
+    }
+  };
 
   const loadEvents = async () => {
     try {
@@ -115,10 +206,36 @@ export default function Telemetry() {
   };
 
   useEffect(() => {
-    Promise.all([loadEvents(), loadStats(), loadConfig()]).finally(() => setLoading(false));
+    Promise.all([
+      loadEvents(),
+      loadStats(),
+      loadConfig(),
+      loadUpdateState(),
+      loadSnapshots(),
+      loadFleetRuns(),
+    ]).finally(() => setLoading(false));
   }, []);
 
   useEffect(() => { loadEvents(); }, [page, categoryFilter, typeFilter]);
+
+  // Phase 4 W4: poll /update/status while applying so the modal reflects
+  // live progress. Stops when the state transitions out of in_flight.
+  useEffect(() => {
+    if (!showApplyProgress) return;
+    const tick = async () => {
+      await loadUpdateState();
+      await loadSnapshots();
+    };
+    const interval = setInterval(tick, 2000);
+    return () => clearInterval(interval);
+  }, [showApplyProgress]);
+
+  useEffect(() => {
+    if (showApplyProgress && updateState && updateState.state !== "in_flight") {
+      // Update flow reached a terminal state — leave the modal open so
+      // the operator can read the outcome, but stop polling.
+    }
+  }, [updateState, showApplyProgress]);
 
   const flash = (text: string, type: string) => {
     setMessage({ text, type });
@@ -138,6 +255,125 @@ export default function Telemetry() {
       flash(e instanceof Error ? e.message : "Failed to save", "error");
     } finally {
       setSaving(false);
+    }
+  };
+
+  // Phase 4 W4: apply update through the panel itself.
+  const applyUpdate = async () => {
+    if (!config.update_available_version) return;
+    setApplyConfirm(false);
+    setApplying(true);
+    setShowApplyProgress(true);
+    try {
+      const target = `v${config.update_available_version}`;
+      await api.post("/update/apply", { target_version: target });
+      flash("Update started — services may briefly become unavailable.", "success");
+      // First status poll fires immediately (the useEffect interval kicks
+      // in once showApplyProgress is true).
+      loadUpdateState();
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Apply failed", "error");
+      setShowApplyProgress(false);
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  const triggerManualCheck = async () => {
+    setChecking(true);
+    try {
+      const resp = await api.post<{ checked_at: string; available_version: string | null }>(
+        "/update/manual-check",
+        {}
+      );
+      flash(
+        resp.available_version
+          ? `Available: v${resp.available_version}`
+          : "No update available — you are on the latest version.",
+        "success"
+      );
+      await Promise.all([loadConfig(), loadUpdateState()]);
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Check failed", "error");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const changeChannel = async (next: string) => {
+    setSavingChannel(true);
+    try {
+      await api.put("/update/channel", { channel: next });
+      flash(`Channel set to ${next}.`, "success");
+      await loadUpdateState();
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Channel change failed", "error");
+    } finally {
+      setSavingChannel(false);
+    }
+  };
+
+  const createManualSnapshot = async () => {
+    setCreatingSnapshot(true);
+    try {
+      await api.post("/snapshots", {});
+      flash("Snapshot created.", "success");
+      await loadSnapshots();
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Snapshot failed", "error");
+    } finally {
+      setCreatingSnapshot(false);
+    }
+  };
+
+  const rollbackToSnapshot = async (snapshotId: string) => {
+    setRollbackConfirm(null);
+    setRollingBack(true);
+    try {
+      await api.post("/update/rollback", { snapshot_id: snapshotId });
+      flash("Rollback started — services restarting.", "success");
+      // The api will die mid-restore; rely on next page load to recover.
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Rollback failed", "error");
+    } finally {
+      setRollingBack(false);
+    }
+  };
+
+  const deleteSnapshot = async (snapshotId: string) => {
+    try {
+      await api.delete(`/snapshots/${snapshotId}`);
+      flash("Snapshot deleted.", "success");
+      await loadSnapshots();
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Delete failed", "error");
+    }
+  };
+
+  const applyToFleet = async () => {
+    if (!fleetVersion.trim()) {
+      flash("Pick a target version first.", "error");
+      return;
+    }
+    setFleetSubmitting(true);
+    try {
+      const resp = await api.post<{ run_id: string; plan_size: number }>(
+        "/update/fleet",
+        {
+          target_version: fleetVersion,
+          halt_on_failure: fleetHalt,
+          include_panel: fleetIncludePanel,
+        }
+      );
+      flash(
+        `Fleet update started: ${resp.plan_size} server(s) queued (run ${resp.run_id.slice(0, 8)}).`,
+        "success"
+      );
+      await loadFleetRuns();
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Fleet apply failed", "error");
+    } finally {
+      setFleetSubmitting(false);
     }
   };
 
@@ -478,32 +714,272 @@ export default function Telemetry() {
             </div>
           )}
 
+          {/* Phase 4 W4: channel selector + apply update from UI */}
+          <div className="bg-dark-800 border border-dark-600 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-medium text-dark-100">Update Channel</h3>
+              <button onClick={triggerManualCheck} disabled={checking}
+                className="px-3 py-1.5 bg-dark-700 text-dark-300 hover:bg-dark-600 hover:text-dark-100 border border-dark-500 rounded-lg text-xs transition-colors disabled:opacity-50">
+                {checking ? "Checking..." : "Check Now"}
+              </button>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              {(["stable", "candidate", "hold"] as const).map(ch => (
+                <button key={ch} disabled={savingChannel} onClick={() => changeChannel(ch)}
+                  className={`px-3 py-2 rounded-lg text-xs font-medium border transition-colors ${
+                    (updateState?.channel || "stable") === ch
+                      ? "bg-rust-500/20 border-rust-500/40 text-rust-200"
+                      : "bg-dark-700 border-dark-600 text-dark-300 hover:bg-dark-600 hover:text-dark-100"
+                  } disabled:opacity-50`}>
+                  {ch === "stable" ? "Stable" : ch === "candidate" ? "Candidate (RC)" : "Hold"}
+                </button>
+              ))}
+            </div>
+            <div className="mt-2 text-xs text-dark-400">
+              {(updateState?.channel || "stable") === "stable" &&
+                "GA releases only (recommended for production)."}
+              {updateState?.channel === "candidate" &&
+                "Includes pre-release builds — may break, snapshot rollback is your safety net."}
+              {updateState?.channel === "hold" &&
+                "Auto-polling disabled. Use Check Now to manually look for updates."}
+            </div>
+          </div>
+
           {config.update_available_version && (
             <div className="bg-dark-800 border border-dark-600 rounded-lg p-4">
-              <h3 className="text-sm font-medium text-dark-100 mb-3">Update Instructions</h3>
-              <div className="bg-dark-900 rounded-lg p-3 border border-dark-700">
-                <pre className="text-xs font-mono text-dark-300 whitespace-pre-wrap">{`# SSH into your server and run:
-cd /path/to/dockpanel
-
-# Pull latest changes
-git pull origin main
-
-# Build new binaries
-source ~/.cargo/env
-cd panel/agent && cargo build --release && cd ../..
-cd panel/backend && cargo build --release && cd ../..
-
-# Deploy
-systemctl stop dockpanel-agent dockpanel-api
-cp panel/agent/target/release/dockpanel-agent /usr/local/bin/
-cp panel/backend/target/release/dockpanel-api /usr/local/bin/
-systemctl start dockpanel-agent dockpanel-api
-
-# Verify
-systemctl is-active dockpanel-agent dockpanel-api`}</pre>
+              <h3 className="text-sm font-medium text-dark-100 mb-3">Apply Update</h3>
+              <div className="bg-dark-900 rounded-lg p-3 border border-dark-700 mb-3">
+                <div className="text-xs text-dark-400 mb-1">Target version</div>
+                <div className="text-sm font-mono text-rust-300">v{config.update_available_version}</div>
+                <div className="text-xs text-dark-400 mt-3 mb-1">What will happen</div>
+                <ol className="text-xs text-dark-300 list-decimal list-inside space-y-0.5">
+                  <li>Pre-update snapshot (binaries + DB dump + /etc/dockpanel)</li>
+                  <li>Download new binaries from GitHub, verify checksums</li>
+                  <li>Swap binaries + restart services (~5s admin UI unavailability)</li>
+                  <li>Health check; auto-rollback on failure within 5min</li>
+                </ol>
               </div>
+              {applyConfirm ? (
+                <div className="flex gap-2 items-center">
+                  <span className="text-sm text-rust-300 font-medium flex-1">Apply v{config.update_available_version}?</span>
+                  <button onClick={() => setApplyConfirm(false)}
+                    className="px-3 py-1.5 bg-dark-700 text-dark-300 hover:bg-dark-600 border border-dark-600 rounded-lg text-xs">
+                    Cancel
+                  </button>
+                  <button onClick={applyUpdate} disabled={applying}
+                    className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium disabled:opacity-50">
+                    {applying ? "Starting..." : "Yes, apply update"}
+                  </button>
+                </div>
+              ) : (
+                <button onClick={() => setApplyConfirm(true)}
+                  disabled={updateState?.state === "in_flight"}
+                  className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
+                  {updateState?.state === "in_flight" ? "Update in flight..." : "Apply Update"}
+                </button>
+              )}
             </div>
           )}
+
+          {/* Snapshots panel */}
+          <div className="bg-dark-800 border border-dark-600 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-medium text-dark-100">
+                Snapshots <span className="text-dark-400 font-normal">({snapshots.length})</span>
+              </h3>
+              <button onClick={createManualSnapshot} disabled={creatingSnapshot}
+                className="px-3 py-1.5 bg-dark-700 text-dark-300 hover:bg-dark-600 hover:text-dark-100 border border-dark-500 rounded-lg text-xs transition-colors disabled:opacity-50">
+                {creatingSnapshot ? "Snapshotting..." : "Snapshot Now"}
+              </button>
+            </div>
+            {snapshots.length === 0 ? (
+              <div className="text-xs text-dark-400 py-3 text-center">
+                No snapshots yet. Pre-update snapshots appear here automatically when you Apply Update.
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {snapshots.map(s => {
+                  const isRollback = rollbackConfirm === s.id;
+                  const isAbandoned = s.to_version === "abandoned";
+                  return (
+                    <div key={s.id} className="flex items-center gap-3 bg-dark-900 border border-dark-700 rounded-lg px-3 py-2">
+                      <div className="flex-1 min-w-0">
+                        <div className="text-xs font-mono text-dark-200 truncate">
+                          v{s.from_version}
+                          {s.to_version && s.to_version !== "abandoned" && s.to_version !== s.from_version && (
+                            <span className="text-dark-400"> → v{s.to_version}</span>
+                          )}
+                          {s.rolled_back_at && (
+                            <span className="text-amber-400 ml-2">(rolled back)</span>
+                          )}
+                          {isAbandoned && (
+                            <span className="text-dark-500 ml-2">(abandoned)</span>
+                          )}
+                        </div>
+                        <div className="text-xs text-dark-400 mt-0.5 flex items-center gap-3">
+                          <span>{formatDate(s.created_at)}</span>
+                          <span>{(s.size_bytes / 1024 / 1024).toFixed(1)} MB</span>
+                          {s.trigger.startsWith("pre-update:") && (
+                            <span className="font-mono text-dark-500">pre-update</span>
+                          )}
+                          {s.trigger === "manual" && (
+                            <span className="font-mono text-dark-500">manual</span>
+                          )}
+                        </div>
+                      </div>
+                      {isRollback ? (
+                        <Fragment>
+                          <span className="text-xs text-amber-400">Destructive — DB will be restored.</span>
+                          <button onClick={() => setRollbackConfirm(null)}
+                            className="px-2 py-1 bg-dark-700 hover:bg-dark-600 text-dark-300 border border-dark-600 rounded text-xs">
+                            Cancel
+                          </button>
+                          <button onClick={() => rollbackToSnapshot(s.id)} disabled={rollingBack}
+                            className="px-2 py-1 bg-danger-500 hover:bg-danger-600 text-white rounded text-xs disabled:opacity-50">
+                            {rollingBack ? "..." : "Roll back"}
+                          </button>
+                        </Fragment>
+                      ) : (
+                        <Fragment>
+                          <button onClick={() => setRollbackConfirm(s.id)}
+                            disabled={updateState?.state === "in_flight"}
+                            className="px-2 py-1 bg-dark-700 hover:bg-dark-600 text-dark-300 border border-dark-600 rounded text-xs disabled:opacity-50">
+                            Roll back
+                          </button>
+                          <button onClick={() => deleteSnapshot(s.id)}
+                            className="px-2 py-1 text-dark-500 hover:text-danger-400 text-xs">
+                            ✕
+                          </button>
+                        </Fragment>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div className="text-xs text-dark-500 mt-3">
+              Retained 7 days (min 3 always kept). Stored under /var/backups/dockpanel/snapshots/.
+            </div>
+          </div>
+
+          {/* Fleet rolling update */}
+          <div className="bg-dark-800 border border-dark-600 rounded-lg p-4">
+            <h3 className="text-sm font-medium text-dark-100 mb-3">Fleet Rolling Update</h3>
+            <div className="text-xs text-dark-400 mb-3">
+              Update all reachable remote agents to a target version, oldest first.
+              Halts on first failure by default.
+            </div>
+            <div className="space-y-2 mb-3">
+              <input type="text" value={fleetVersion} onChange={e => setFleetVersion(e.target.value)}
+                placeholder="vX.Y.Z (e.g. v2.10.0)"
+                className="w-full bg-dark-900 border border-dark-600 text-dark-100 text-sm rounded-lg px-3 py-1.5 font-mono" />
+              <label className="flex items-center gap-2 text-xs text-dark-300">
+                <input type="checkbox" checked={fleetHalt} onChange={e => setFleetHalt(e.target.checked)}
+                  className="rounded bg-dark-900 border-dark-600" />
+                Halt on first failure
+              </label>
+              <label className="flex items-center gap-2 text-xs text-dark-300">
+                <input type="checkbox" checked={fleetIncludePanel} onChange={e => setFleetIncludePanel(e.target.checked)}
+                  className="rounded bg-dark-900 border-dark-600" />
+                Include this panel server (runs last)
+              </label>
+            </div>
+            <button onClick={applyToFleet} disabled={fleetSubmitting || !fleetVersion.trim()}
+              className="px-4 py-2 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50">
+              {fleetSubmitting ? "Starting..." : "Apply to Fleet"}
+            </button>
+
+            {fleetRuns.length > 0 && (
+              <div className="mt-4">
+                <div className="text-xs text-dark-400 mb-2">Recent runs</div>
+                <div className="space-y-2">
+                  {fleetRuns.slice(0, 5).map(r => {
+                    const outcomeColor =
+                      r.outcome === "success"
+                        ? "text-emerald-400"
+                        : r.outcome === "partial"
+                        ? "text-amber-400"
+                        : r.outcome === "halted"
+                        ? "text-danger-400"
+                        : "text-dark-300";
+                    return (
+                      <div key={r.id} className="bg-dark-900 border border-dark-700 rounded-lg px-3 py-2 text-xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-mono text-dark-200">v{r.target_version.replace(/^v/, "")}</span>
+                          <span className={`font-medium ${outcomeColor}`}>
+                            {r.outcome || "running..."}
+                          </span>
+                        </div>
+                        <div className="text-dark-400 mt-1">
+                          {formatDate(r.started_at)} ·{" "}
+                          {Array.isArray(r.progress)
+                            ? `${r.progress.filter(p => p.status === "succeeded").length}/${r.progress.length} succeeded`
+                            : "—"}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Apply progress modal */}
+      {showApplyProgress && updateState && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="bg-dark-800 border border-dark-600 rounded-lg p-6 max-w-md w-full">
+            <h3 className="text-base font-medium text-dark-100 mb-3">
+              {updateState.state === "in_flight" && "Update in progress"}
+              {updateState.state === "succeeded" && "Update complete"}
+              {updateState.state === "rolled_back" && "Update rolled back"}
+              {updateState.state === "failed" && "Update failed"}
+              {updateState.state === "idle" && "Update finished"}
+            </h3>
+            {updateState.state === "in_flight" && (
+              <Fragment>
+                <div className="flex items-center gap-3 mb-3">
+                  <div className="w-3 h-3 rounded-full bg-rust-500 animate-pulse" />
+                  <span className="text-sm text-dark-300">
+                    Targeting v{updateState.target_version}
+                  </span>
+                </div>
+                {updateState.last_log_line && (
+                  <pre className="text-xs font-mono text-dark-400 bg-dark-900 border border-dark-700 rounded p-2 whitespace-pre-wrap break-all">
+                    {updateState.last_log_line}
+                  </pre>
+                )}
+                <div className="text-xs text-dark-500 mt-3">
+                  Services may briefly be unavailable. The UI may also disconnect while binaries swap; refresh once it returns.
+                </div>
+              </Fragment>
+            )}
+            {updateState.state === "succeeded" && (
+              <div className="text-sm text-emerald-300 mb-3">
+                v{updateState.from_version} → v{updateState.to_version}
+              </div>
+            )}
+            {updateState.state === "rolled_back" && (
+              <div className="text-sm text-amber-300 mb-3">
+                Health check failed; rolled back to v{updateState.attempted_version
+                  ? config.current_version
+                  : "previous"}
+                .
+              </div>
+            )}
+            {updateState.state === "failed" && (
+              <div className="text-sm text-danger-300 mb-3">
+                {updateState.reason || "Unknown failure"}
+              </div>
+            )}
+            <div className="flex justify-end">
+              <button onClick={() => setShowApplyProgress(false)}
+                className="px-3 py-1.5 bg-dark-700 text-dark-300 hover:bg-dark-600 hover:text-dark-100 border border-dark-600 rounded-lg text-xs">
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

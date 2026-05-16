@@ -55,6 +55,7 @@ pub mod passkeys;
 pub mod prometheus;
 pub mod webhook_gateway;
 pub mod telemetry;
+pub mod update;
 pub mod whmcs;
 pub mod wordpress;
 pub mod ws_metrics;
@@ -879,6 +880,16 @@ pub fn router() -> Router<AppState> {
         // Escalation Policies (Phase 4 W3)
         .route("/api/escalation-policies", get(escalation_policies::list_policies).post(escalation_policies::create_policy))
         .route("/api/escalation-policies/{id}", get(escalation_policies::get_policy).put(escalation_policies::update_policy).delete(escalation_policies::delete_policy))
+        // Phase 4 W4: panel self-update + snapshots + fleet rolling update
+        .route("/api/update/status", get(update::get_status))
+        .route("/api/update/apply", post(update::apply_update))
+        .route("/api/update/manual-check", post(update::manual_check))
+        .route("/api/update/rollback", post(update::rollback))
+        .route("/api/update/channel", get(update::get_channel).put(update::put_channel))
+        .route("/api/snapshots", get(update::list_snapshots_route).post(update::create_snapshot_route))
+        .route("/api/snapshots/{id}", delete(update::delete_snapshot_route))
+        .route("/api/update/fleet", get(update::list_fleet_runs).post(update::apply_fleet))
+        .route("/api/update/fleet/{id}", get(update::get_fleet_run))
         // Notification Center
         .route("/api/notifications", get(notifications::list))
         .route("/api/notifications/unread-count", get(notifications::unread_count))
