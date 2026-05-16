@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.8.23] - 2026-05-16
+
+### Changed
+
+- **SSL renewal cadence is now profile-aware.** The auto-healer previously
+  used a hardcoded 6h cooldown for both ARI re-fetch (RFC 9773) and the
+  post-attempt retry. For the new `shortlived` profile (6-day certs whose
+  renewal window is only ~4 days wide), 6h was 6% of the cert lifetime — a
+  CA-issued early-renew nudge could be missed by a full quarter-day, and a
+  failed attempt near expiry could burn the whole window. The cooldown is
+  now 1h for `shortlived` and stays at 6h for `tlsserver` (45d) and
+  `classic` (90d → 64d → 45d across the LE roadmap). Lets-Encrypt's
+  tlsserver profile transitioned to 45-day issuance on 2026-05-13, which
+  is what unblocked this change.
+
+### Added
+
+- **New Prometheus counter: `dockpanel_cert_renewals_total{result}`** with
+  `result="success"` and `result="failure"` labels. Tracks auto-healer
+  renewal attempts so operators can graph trend and alert on
+  `rate(...{result="failure"}[1h])`. The counter is process-local (resets
+  across restart — Prometheus `increase()` handles that gracefully) and
+  adds zero DB queries per scrape.
+
+  Exposed at `/metrics` alongside the existing `dockpanel_info`,
+  `dockpanel_site_count`, and `dockpanel_alerts_firing` gauges.
+
 ## [2.8.22] - 2026-05-16
 
 ### Fixed

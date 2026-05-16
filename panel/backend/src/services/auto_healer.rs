@@ -1,11 +1,21 @@
 use crate::safe_cmd::safe_command;
 use chrono::Datelike;
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::services::activity;
 use crate::services::agent::AgentClient;
 use crate::services::notifications;
+
+/// Cumulative count of auto-healer SSL renewal attempts that succeeded.
+/// Read by the Prometheus exporter and published as
+/// `dockpanel_cert_renewals_total{result="success"}`. In-process atomic
+/// (resets across restart — Prometheus `increase()` handles the reset).
+pub static SSL_RENEWALS_SUCCESS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative count of auto-healer SSL renewal attempts that failed.
+/// Published as `dockpanel_cert_renewals_total{result="failure"}`.
+pub static SSL_RENEWALS_FAILURE: AtomicU64 = AtomicU64::new(0);
 
 /// Background task: auto-heals common issues when detected.
 /// Runs every 120 seconds (offset from alert engine to spread load).
@@ -516,9 +526,11 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             }
         };
 
-        // Phase 1 — refresh ARI suggestion if stale or missing.
+        // Phase 1 — refresh ARI suggestion if stale or missing. Cooldown is
+        // profile-aware so shortlived (6-day) certs poll the CA more often
+        // than long-lived ones.
         let needs_ari = ssl_renewal_checked_at
-            .map(|t| (now - t) > chrono::Duration::hours(6))
+            .map(|t| (now - t) > profile_cooldown(ssl_profile.as_deref()))
             .unwrap_or(true);
         if needs_ari {
             let ari_path = format!(
@@ -566,13 +578,17 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             continue;
         }
 
-        // 6-hour cooldown prevents hammering the CA if renewal keeps failing.
-        let recent: Option<(i64,)> = sqlx::query_as(
+        // Profile-aware cooldown prevents hammering the CA if renewal keeps
+        // failing. Shortlived gets 1h so a failed attempt near expiry doesn't
+        // burn the whole renewal window; everything else stays at 6h.
+        // cooldown_hours is a typed i64 — safe to interpolate directly.
+        let cooldown_hours = profile_cooldown(ssl_profile.as_deref()).num_hours();
+        let recent: Option<(i64,)> = sqlx::query_as(&format!(
             "SELECT COUNT(*) FROM activity_logs \
              WHERE action = 'auto_heal.renew_ssl' \
              AND target_name = $1 \
-             AND created_at > NOW() - INTERVAL '6 hours'",
-        )
+             AND created_at > NOW() - INTERVAL '{cooldown_hours} hours'",
+        ))
         .bind(domain)
         .fetch_optional(pool)
         .await
@@ -649,6 +665,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
                 }
             }
             tracing::info!("Auto-heal: SSL renewed for {domain}");
+            SSL_RENEWALS_SUCCESS.fetch_add(1, Ordering::Relaxed);
 
             // Panel notification
             notifications::notify_panel(pool, None, &format!("SSL renewed: {}", domain), &format!("SSL certificate for {} was automatically renewed", domain), "info", "ssl", None).await;
@@ -686,6 +703,7 @@ async fn auto_renew_ssl(pool: &PgPool, agent: &AgentClient) {
             ).await;
 
             tracing::warn!("Auto-heal: SSL renewal failed for {domain}: {details}");
+            SSL_RENEWALS_FAILURE.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -703,6 +721,18 @@ fn fallback_renewal_margin(profile: Option<&str>) -> chrono::Duration {
         Some("shortlived") => chrono::Duration::days(2),
         Some("tlsserver") => chrono::Duration::days(15),
         _ => chrono::Duration::days(30),
+    }
+}
+
+/// Per-profile cooldown for ARI re-fetch + post-attempt retry. Shortlived
+/// (6-day) certs poll tighter so a CA-issued early-renew nudge isn't missed
+/// by a full quarter-day, and a failed attempt near expiry doesn't burn the
+/// whole renewal window. Longer profiles stay at 6h to keep CA-side rate
+/// pressure low.
+fn profile_cooldown(profile: Option<&str>) -> chrono::Duration {
+    match profile {
+        Some("shortlived") => chrono::Duration::hours(1),
+        _ => chrono::Duration::hours(6),
     }
 }
 
@@ -1354,5 +1384,30 @@ async fn auto_sleep_idle_containers(pool: &PgPool, agent: &AgentClient) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_shortlived_is_one_hour() {
+        assert_eq!(profile_cooldown(Some("shortlived")), chrono::Duration::hours(1));
+    }
+
+    #[test]
+    fn cooldown_tlsserver_is_six_hours() {
+        assert_eq!(profile_cooldown(Some("tlsserver")), chrono::Duration::hours(6));
+    }
+
+    #[test]
+    fn cooldown_classic_is_six_hours() {
+        assert_eq!(profile_cooldown(Some("classic")), chrono::Duration::hours(6));
+    }
+
+    #[test]
+    fn cooldown_none_is_six_hours() {
+        assert_eq!(profile_cooldown(None), chrono::Duration::hours(6));
     }
 }

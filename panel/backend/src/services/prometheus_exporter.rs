@@ -17,6 +17,7 @@ pub async fn render(pool: &PgPool) -> String {
     render_system(&mut out, pool).await;
     render_gpu(&mut out, pool).await;
     render_sites(&mut out, pool).await;
+    render_cert_renewals(&mut out);
     render_alerts(&mut out, pool).await;
 
     out
@@ -137,6 +138,22 @@ async fn render_sites(out: &mut String, pool: &PgPool) {
     }
 }
 
+fn render_cert_renewals(out: &mut String) {
+    use crate::services::auto_healer::{SSL_RENEWALS_FAILURE, SSL_RENEWALS_SUCCESS};
+    use std::sync::atomic::Ordering;
+
+    let success = SSL_RENEWALS_SUCCESS.load(Ordering::Relaxed);
+    let failure = SSL_RENEWALS_FAILURE.load(Ordering::Relaxed);
+
+    let _ = writeln!(
+        out,
+        "# HELP dockpanel_cert_renewals_total SSL certificate renewal attempts grouped by result."
+    );
+    let _ = writeln!(out, "# TYPE dockpanel_cert_renewals_total counter");
+    let _ = writeln!(out, "dockpanel_cert_renewals_total{{result=\"success\"}} {success}");
+    let _ = writeln!(out, "dockpanel_cert_renewals_total{{result=\"failure\"}} {failure}");
+}
+
 async fn render_alerts(out: &mut String, pool: &PgPool) {
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT severity, COUNT(*) FROM alerts WHERE status = 'firing' GROUP BY severity",
@@ -196,7 +213,9 @@ fn push_escaped(out: &mut String, s: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::push_escaped;
+    use super::{push_escaped, render_cert_renewals};
+    use crate::services::auto_healer::{SSL_RENEWALS_FAILURE, SSL_RENEWALS_SUCCESS};
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn escapes_dangerous_chars() {
@@ -217,5 +236,19 @@ mod tests {
         let mut s = String::new();
         push_escaped(&mut s, "my-server-01");
         assert_eq!(s, "my-server-01");
+    }
+
+    #[test]
+    fn cert_renewals_render_emits_counter_with_both_labels() {
+        SSL_RENEWALS_SUCCESS.store(7, Ordering::Relaxed);
+        SSL_RENEWALS_FAILURE.store(2, Ordering::Relaxed);
+        let mut out = String::new();
+        render_cert_renewals(&mut out);
+        assert!(out.contains("# TYPE dockpanel_cert_renewals_total counter"));
+        assert!(out.contains(r#"dockpanel_cert_renewals_total{result="success"} 7"#));
+        assert!(out.contains(r#"dockpanel_cert_renewals_total{result="failure"} 2"#));
+        // Reset so other tests don't see lingering state.
+        SSL_RENEWALS_SUCCESS.store(0, Ordering::Relaxed);
+        SSL_RENEWALS_FAILURE.store(0, Ordering::Relaxed);
     }
 }
