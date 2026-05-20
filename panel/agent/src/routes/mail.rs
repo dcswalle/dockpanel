@@ -923,8 +923,16 @@ async fn write_webmail_nginx(port: u16) -> Result<(), ApiErr> {
     if let Err(e) = std::fs::create_dir_all(WEBMAIL_NGINX_DIR) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create {WEBMAIL_NGINX_DIR}: {e}")));
     }
+    // v2.10.1: Roundcube emits root-anchored URLs (form action="/?_task=...",
+    // JS comm_path="/?_task=..."). Without sub_filter, browser navigation
+    // and AJAX from Roundcube hit the panel's `location /` (the React SPA),
+    // not /webmail/ — symptom: Open lands on dashboard, login form posts
+    // to /?_task=login. proxy_redirect handles 30x Location: headers from
+    // Roundcube; sub_filter rewrites embedded URLs in HTML/JSON bodies.
     let block = format!(
         "# DockPanel webmail (Roundcube) reverse-proxy — managed by agent, do not edit\n\
+         # v2.10.1: sub_filter rewrites Roundcube's root-anchored URLs (form action,\n\
+         # comm_path) under /webmail/ so navigation doesn't land on the panel root.\n\
          location /webmail/ {{\n\
          \x20   proxy_pass http://127.0.0.1:{port}/;\n\
          \x20   proxy_http_version 1.1;\n\
@@ -933,7 +941,11 @@ async fn write_webmail_nginx(port: u16) -> Result<(), ApiErr> {
          \x20   proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n\
          \x20   proxy_set_header X-Forwarded-Proto $scheme;\n\
          \x20   proxy_set_header X-Forwarded-Host $host;\n\
-         \x20   proxy_redirect off;\n\
+         \x20   proxy_set_header Accept-Encoding \"\";\n\
+         \x20   proxy_redirect / /webmail/;\n\
+         \x20   sub_filter '\"/?_task=' '\"/webmail/?_task=';\n\
+         \x20   sub_filter_once off;\n\
+         \x20   sub_filter_types text/html application/json application/javascript text/javascript;\n\
          \x20   proxy_read_timeout 300s;\n\
          \x20   client_max_body_size 25M;\n\
          }}\n"

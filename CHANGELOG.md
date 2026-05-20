@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.10.1] - 2026-05-20
+
+Hotfix for the v2.8.22 webmail reverse-proxy regression reported in
+[#57](https://github.com/ovexro/dockpanel/issues/57).
+
+### Fixed
+- **Webmail "Open" landed on the panel dashboard instead of Roundcube
+  login.** Roundcube emits root-anchored URLs in its HTML (form
+  `action="/?_task=login"`) and inline JS (`comm_path: "/?_task=login"`)
+  — it has no concept that it lives under `/webmail/` on the panel
+  vhost. The v2.8.22 nginx fragment proxied with `proxy_redirect off`
+  and no body rewriting, so the browser navigated to `/?_task=login` →
+  hit the panel's `location /` block → rendered the React SPA
+  (dashboard). The CPU spike in the report was Roundcube's container
+  booting on first hit. Fix in `panel/agent/src/routes/mail.rs:926`:
+  added `proxy_redirect / /webmail/;` to rewrite 30x `Location:`
+  headers and `sub_filter '"/?_task=' '"/webmail/?_task=';` to rewrite
+  embedded URLs in HTML/JSON/JS bodies. Also clears `Accept-Encoding`
+  to upstream so `sub_filter` receives uncompressed responses.
+- **Auto-heal for existing webmail installs.** v2.8.22 → v2.10.0 boxes
+  already have the broken fragment on disk; the agent only writes on
+  Install click, so users would have to Remove + Install to recover.
+  `scripts/update.sh:428` detects the old shape (no `sub_filter` line)
+  and regenerates the fragment from the current template, using the
+  current Roundcube container's host port from `docker inspect`.
+
 ## [2.10.0] - 2026-05-16
 
 Phase 4 W4 ships **panel self-update from the UI** with health-check
