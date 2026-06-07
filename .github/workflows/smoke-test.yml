@@ -92,26 +92,29 @@ jobs:
             fi
           done
 
-      - name: Exec probe (loader must accept the binary on this distro)
+      - name: Exec probe (loader must accept the binaries on this distro)
         run: |
-          set -eu
-          # CLI: prints version and exits 0 — proves the loader ran main() cleanly.
-          ./dockpanel-cli --version | grep -qi dockpanel
-          # API: accepts --version and exits 0 (the loader must accept the binary).
-          ./dockpanel-api --version
-          # Agent: confirm no loader/GLIBC error. Reaching its startup log is a
-          # bonus signal (warn-only, since CI lacks the agent's full runtime env).
+          set -u
           mkdir -p /var/run/dockpanel
-          set +e
-          timeout 6 ./dockpanel-agent > agent.out 2>&1
-          set -e
-          echo "--- agent output ---"; cat agent.out || true
-          if grep -qiE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error" agent.out; then
-            echo "FAIL: loader/ABI error running the agent on ${{ matrix.distro }}"
-            exit 1
+          fail=0
+          # A static binary that loads correctly reaches main(). It may then exit
+          # non-zero for a benign runtime reason (the API/agent panic on missing
+          # JWT_SECRET/DATABASE_URL env, the agent boots until timeout) — that is
+          # NOT a #70 failure. We ONLY hard-fail on a real loader/ABI error, which
+          # is the exact signature #70 produced (`... GLIBC_2.38 not found`).
+          for b in cli api agent; do
+            out="$(timeout 6 ./dockpanel-$b --version 2>&1)"; rc=$?
+            echo "--- dockpanel-$b (rc=$rc) ---"
+            printf '%s\n' "$out" | head -4
+            if printf '%s' "$out" | grep -qiE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error"; then
+              echo "FAIL: loader/ABI error for dockpanel-$b on ${{ matrix.distro }} — the #70 break."
+              fail=1
+            fi
+          done
+          # Positive proof that at least one binary reaches main() on this distro:
+          # the CLI has a real --version path that prints and exits 0.
+          if ! ./dockpanel-cli --version | grep -qi dockpanel; then
+            echo "FAIL: dockpanel-cli --version did not print a version on ${{ matrix.distro }}"
+            fail=1
           fi
-          if grep -qiE "TLS cert fingerprint|listening|dockpanel_agent" agent.out; then
-            echo "OK: agent reached startup on ${{ matrix.distro }}"
-          else
-            echo "::warning::agent did not emit a startup log on ${{ matrix.distro }} (no loader error though) — static-link + CLI/API probes still passed"
-          fi
+          exit $fail
