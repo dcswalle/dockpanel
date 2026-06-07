@@ -94,7 +94,11 @@ jobs:
 
       - name: Exec probe (loader must accept the binaries on this distro)
         run: |
-          set -u
+          # GitHub Actions invokes bash with `-eo pipefail` by default, so a
+          # benign non-zero exit (the API/agent panic on missing env, captured
+          # via command substitution) would otherwise abort the step. Neutralise
+          # both and manage exit codes explicitly via $fail.
+          set +e +o pipefail
           mkdir -p /var/run/dockpanel
           fail=0
           # A static binary that loads correctly reaches main(). It may then exit
