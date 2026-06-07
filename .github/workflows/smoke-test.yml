@@ -52,6 +52,11 @@ jobs:
   smoke:
     needs: resolve
     runs-on: ubuntu-latest
+    # Force bash in the distro containers (default would be `sh`/dash on some
+    # images, which rejects `set -o pipefail` and bash-isms used below).
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
