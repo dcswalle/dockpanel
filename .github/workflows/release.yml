@@ -17,14 +17,12 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
             arch: amd64
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
             arch: arm64
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v6
@@ -33,6 +31,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Static musl binaries (zero glibc dependency) so the agent/API/CLI run on
+      # the whole support matrix regardless of distro libc version — Debian 11/12,
+      # Ubuntu 20.04+, CentOS/Rocky 9, Amazon Linux 2023 (#70). cargo-zigbuild uses
+      # Zig's bundled clang as the C cross-compiler, which builds aws-lc-sys (the
+      # only C dependency in the tree) statically for both musl targets from a
+      # single x86_64 runner. The rest of the TLS stack is pure rustls.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Cache Rust dependencies
         uses: actions/cache@v5
@@ -49,29 +63,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Install cross-compilation tools (ARM64)
-        if: matrix.arch == 'arm64'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - name: Build agent (static musl)
+        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/agent/Cargo.toml
 
-      - name: Configure cross-compilation (ARM64)
-        if: matrix.arch == 'arm64'
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml << 'EOF'
-          [target.aarch64-unknown-linux-gnu]
-          linker = "aarch64-linux-gnu-gcc"
-          EOF
+      - name: Build API (static musl)
+        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/backend/Cargo.toml
 
-      - name: Build agent
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path panel/agent/Cargo.toml
-
-      - name: Build API
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path panel/backend/Cargo.toml
-
-      - name: Build CLI
-        run: cargo build --release --target ${{ matrix.target }} --manifest-path panel/cli/Cargo.toml
+      - name: Build CLI (static musl)
+        run: cargo zigbuild --release --target ${{ matrix.target }} --manifest-path panel/cli/Cargo.toml
 
       - name: Package binaries
         run: |
@@ -81,9 +80,11 @@ jobs:
           cp panel/cli/target/${{ matrix.target }}/release/dockpanel release/dockpanel-cli-linux-${{ matrix.arch }}
           chmod +x release/*
 
-          # Report binary sizes
+          # Report binary sizes + confirm static linkage
           echo "Binary sizes (${{ matrix.arch }}):"
           ls -lh release/
+          echo "Linkage check:"
+          file release/dockpanel-agent-linux-${{ matrix.arch }}
 
       - name: Install cargo-sbom
         if: matrix.arch == 'amd64'

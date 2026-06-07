@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.10.2] - 2026-06-07
+
+Fixes two fresh-install blockers reported in
+[#70](https://github.com/ovexro/dockpanel/issues/70) and
+[#71](https://github.com/ovexro/dockpanel/issues/71).
+
+### Fixed
+- **Install failed on Debian 12 with `GLIBC_2.38 / GLIBC_2.39 not
+  found`** ([#70](https://github.com/ovexro/dockpanel/issues/70)).
+  Release binaries were built on `ubuntu-latest` (now Ubuntu 24.04,
+  glibc 2.39), so the dynamically-linked agent/API/CLI demanded
+  glibc ≥ 2.38 and the agent refused to start on Debian 12 (glibc 2.36).
+  The same break silently affected the *rest* of the documented support
+  matrix — Ubuntu 20.04, Debian 11, CentOS 9, Rocky 9, Amazon Linux 2023
+  all ship glibc ≤ 2.34. The release workflow now builds **fully static
+  musl binaries** (`x86_64-unknown-linux-musl` /
+  `aarch64-unknown-linux-musl`) via `cargo-zigbuild`, so the binaries
+  carry zero glibc dependency and run on any modern Linux regardless of
+  distro libc version (`ldd` reports "statically linked"). DockPanel's
+  TLS stack is entirely rustls, so there is no OpenSSL system dependency
+  to block static linking.
+- **First login bounced straight back to the login screen on a domain
+  install served over HTTP**
+  ([#71](https://github.com/ovexro/dockpanel/issues/71)). When a domain
+  is supplied at setup, `setup.sh` writes `BASE_URL=https://<domain>`,
+  but the panel vhost is served over plain HTTP until TLS is added. The
+  cookie helper keyed the `Secure` flag off `BASE_URL`, so it stamped
+  `Secure` on the session cookie even though the response left over HTTP
+  — the browser silently dropped the cookie and the next
+  `/api/auth/me` 401'd, bouncing the user back to the login screen in
+  every browser. This was the case the [#47](https://github.com/ovexro/dockpanel/issues/47)
+  fix left open (it only removed the empty-`BASE_URL` path).
+  `routes/auth.rs::cookie_secure_flag` and the OAuth callback now derive
+  `Secure` solely from the actual request scheme (`X-Forwarded-Proto`,
+  which nginx always sets and is authoritative because the API only
+  listens on `127.0.0.1` behind the proxy). HTTPS installs still get a
+  `Secure` cookie; HTTP-served installs no longer bounce.
+
 ## [2.10.1] - 2026-05-20
 
 Hotfix for the v2.8.22 webmail reverse-proxy regression reported in

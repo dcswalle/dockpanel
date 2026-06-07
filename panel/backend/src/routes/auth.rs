@@ -396,9 +396,17 @@ pub fn request_is_https(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn cookie_secure_flag(state: &AppState, headers: &HeaderMap) -> &'static str {
-    let base_is_https = state.config.base_url.starts_with("https");
-    if base_is_https || request_is_https(headers) {
+pub(crate) fn cookie_secure_flag(headers: &HeaderMap) -> &'static str {
+    // Tie Secure strictly to the actual connection scheme as seen by nginx
+    // (X-Forwarded-Proto $scheme). Do NOT key off BASE_URL: setup.sh writes
+    // BASE_URL=https://<domain> when a domain is supplied, but the panel vhost
+    // is served over plain HTTP until TLS is added. The old base_url=https
+    // branch then forced a Secure cookie the browser silently dropped on the
+    // HTTP response, bouncing the very first login (#71 — the case the #47 fix
+    // left open). request_is_https is authoritative because the API only ever
+    // listens on 127.0.0.1 behind nginx, so the scheme can only come from the
+    // proxy header.
+    if request_is_https(headers) {
         "; Secure"
     } else {
         ""
@@ -439,7 +447,7 @@ pub fn issue_session_pub(
     )
     .map_err(|e| internal_error("login", e))?;
 
-    let secure_flag = cookie_secure_flag(state, headers);
+    let secure_flag = cookie_secure_flag(headers);
     let cookie = format!(
         "token={token}; Path=/; HttpOnly{secure_flag}; SameSite=Lax; Max-Age=7200"
     );
@@ -478,7 +486,7 @@ pub async fn logout(
         }
     }
 
-    let secure_flag = cookie_secure_flag(&state, &headers);
+    let secure_flag = cookie_secure_flag(&headers);
     let cookie = format!("token=; Path=/; HttpOnly{secure_flag}; SameSite=Lax; Max-Age=0");
     (
         StatusCode::OK,

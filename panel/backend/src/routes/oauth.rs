@@ -344,14 +344,9 @@ pub async fn callback(
 
     // Set cookie and redirect to dashboard.
     // Browsers reject Secure cookies on HTTP — only set Secure when the request
-    // arrived over HTTPS (#47, v2.8.14).
-    let secure_flag = if state.config.base_url.starts_with("https")
-        || crate::routes::auth::request_is_https(&headers)
-    {
-        "; Secure"
-    } else {
-        ""
-    };
+    // actually arrived over HTTPS (#47, v2.8.14; #71 — must NOT key off BASE_URL,
+    // which is https for a domain even while the vhost is served over HTTP).
+    let secure_flag = crate::routes::auth::cookie_secure_flag(&headers);
     let cookie = format!(
         "token={token}; HttpOnly{secure_flag}; SameSite=Lax; Path=/; Max-Age=7200"
     );
