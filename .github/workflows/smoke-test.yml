@@ -1,0 +1,117 @@
+name: Install smoke-test
+
+# ABI / loader smoke-test for the published release binaries (#70 regression guard).
+#
+# Why this exists: v2.10.2 fixed installs failing on Debian 12 with
+# `GLIBC_2.38 not found` — the release binaries were dynamically linked against
+# a too-new glibc from the ubuntu-latest build runner. The fix ships fully
+# static musl binaries. This workflow proves, on every published release, that
+# the actual downloadable assets are statically linked AND exec cleanly (no
+# loader/GLIBC error) across the documented support-matrix distros — so a future
+# change that reintroduces a glibc dependency is caught before users hit it.
+#
+# Scope: this is an ABI/loader smoke-test, NOT a full functional install. The
+# heavier end-to-end `install.sh` test (Docker + Postgres + nginx provisioning)
+# is the separate fresh-VPS gate. Covers amd64 + the apt-based distros that span
+# the glibc floor (Debian 11 / Ubuntu 20.04 = glibc 2.31) up to the newest.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to test (blank = latest)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+    steps:
+      - id: t
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ -n "${{ github.event.release.tag_name }}" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="$(gh release view --repo '${{ github.repository }}' --json tagName -q .tagName)"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Smoke-testing release: $TAG"
+
+  smoke:
+    needs: resolve
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - debian:11
+          - debian:12
+          - debian:13
+          - ubuntu:20.04
+          - ubuntu:22.04
+          - ubuntu:24.04
+    container:
+      image: ${{ matrix.distro }}
+    steps:
+      - name: Install fetch deps
+        run: |
+          set -eux
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates file >/dev/null
+
+      - name: Download published binaries (amd64)
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          for b in agent api cli; do
+            curl -fsSL "${BASE}/dockpanel-${b}-linux-amd64" -o "dockpanel-${b}"
+            chmod +x "dockpanel-${b}"
+          done
+
+      - name: Assert static linkage (primary #70 guard)
+        run: |
+          set -eux
+          for b in agent api cli; do
+            file "dockpanel-${b}"
+            if ! file "dockpanel-${b}" | grep -q "statically linked"; then
+              echo "FAIL: dockpanel-${b} is NOT statically linked on ${{ matrix.distro }} — would reintroduce the #70 glibc break."
+              exit 1
+            fi
+          done
+
+      - name: Exec probe (loader must accept the binary on this distro)
+        run: |
+          set -eu
+          # CLI: prints version and exits 0 — proves the loader ran main() cleanly.
+          ./dockpanel-cli --version | grep -qi dockpanel
+          # API: accepts --version and exits 0 (the loader must accept the binary).
+          ./dockpanel-api --version
+          # Agent: confirm no loader/GLIBC error. Reaching its startup log is a
+          # bonus signal (warn-only, since CI lacks the agent's full runtime env).
+          mkdir -p /var/run/dockpanel
+          set +e
+          timeout 6 ./dockpanel-agent > agent.out 2>&1
+          set -e
+          echo "--- agent output ---"; cat agent.out || true
+          if grep -qiE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error" agent.out; then
+            echo "FAIL: loader/ABI error running the agent on ${{ matrix.distro }}"
+            exit 1
+          fi
+          if grep -qiE "TLS cert fingerprint|listening|dockpanel_agent" agent.out; then
+            echo "OK: agent reached startup on ${{ matrix.distro }}"
+          else
+            echo "::warning::agent did not emit a startup log on ${{ matrix.distro }} (no loader error though) — static-link + CLI/API probes still passed"
+          fi
