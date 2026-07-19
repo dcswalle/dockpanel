@@ -26,15 +26,22 @@
 #
 # WHAT A ROLLBACK DOES AND DOES NOT DO (verified on a lab box, not assumed):
 #   It restores what the snapshot CONTAINS — the three binaries, /etc/dockpanel,
-#   and every database object present in the dump. Because `pg_dump --clean` can
-#   only drop objects it knows about, anything created AFTER the snapshot
-#   SURVIVES the rollback: a table added by a newer version's migration is still
-#   there afterwards, while _sqlx_migrations has been rewound to the older state.
-#   The older binary is unaffected (it never knew about those objects), but a
-#   later forward update to that newer version will try to re-apply a migration
-#   whose objects already exist. Nothing outside the snapshot is touched at all:
-#   /etc/nginx, /etc/letsencrypt, /var/www, docker volumes and site data are NOT
-#   rewound. A rollback is "put the panel back", not "put the machine back".
+#   and the database. The database is a true point-in-time revert: the `public`
+#   schema is dropped and rebuilt from the dump inside one transaction, so an
+#   object created after the snapshot does NOT survive.
+#
+#   That is a deliberate change from v2.11.5/v2.11.6, where the restore applied
+#   only the dump's own DROP statements and therefore MERGED the snapshot into
+#   whatever was there. Post-snapshot tables outlived the rollback while
+#   _sqlx_migrations was rewound, and a later forward update then re-ran a
+#   migration whose objects already existed: the api panicked at startup and
+#   crash-looped into a permanent 502. Reproduced end to end before this was
+#   changed. The data those extra tables held is not silently discarded — the
+#   pre-rollback dump written below captures the full pre-restore database.
+#
+#   Nothing outside the snapshot is touched at all: /etc/nginx, /etc/letsencrypt,
+#   /var/www, docker volumes and site data are NOT rewound. A rollback is "put the
+#   panel back", not "put the machine back".
 #
 # Env (all set by the caller):
 #   DOCKPANEL_SNAPSHOT_ID        uuid of the snapshot row
@@ -159,7 +166,16 @@ DUMP_SQL="$WORK/db/dump.sql"
 stage="verify-dump"
 if [ -f "$DUMP_GZ" ]; then
     gunzip -c "$DUMP_GZ" > "$DUMP_SQL" || fail "gunzip of the database dump failed"
-    if ! tail -5 "$DUMP_SQL" | grep -q 'PostgreSQL database dump complete'; then
+    # The window is deliberately wider than the marker's current position. pg_dump
+    # writes the marker near the end but not necessarily last: PostgreSQL's
+    # August-2025 minors added a trailing `\unrestrict` line, which on the lab put
+    # the marker at line 6243 of 6247 — inside a 5-line window by exactly zero
+    # lines to spare. One more trailer from any future pg_dump and this check
+    # would reject EVERY snapshot as truncated, breaking rollback completely.
+    # It stays a tail window rather than a whole-file grep on purpose: this panel
+    # stores operator-authored text, so the marker string can legitimately appear
+    # inside the data and a whole-file grep could not tell that from a real end.
+    if ! tail -20 "$DUMP_SQL" | grep -q 'PostgreSQL database dump complete'; then
         fail "database dump is truncated (completion marker absent) — refusing to apply it"
     fi
     EXPECT_TABLES="$(grep -c '^CREATE TABLE' "$DUMP_SQL" || true)"
@@ -199,16 +215,70 @@ if [ -f "$DUMP_SQL" ]; then
     if bash -c "set -o pipefail; docker exec '$PG_CONTAINER' pg_dump -U '$PG_USER' --clean --if-exists '$PG_DB' | gzip > '$PRE_DUMP'"; then
         chmod 0600 "$PRE_DUMP" 2>/dev/null || true
         log "pre-rollback state saved to $PRE_DUMP"
+        # These are now the only way back from a rollback, so they are worth
+        # keeping — but nothing else in the product ever deletes them (the
+        # retention sweep walks panel_snapshots rows and tarballs, not this
+        # directory), and one is written on every rollback. Keep the newest few.
+        # A failed prune must never fail a restore, so it is reported, not fatal.
+        ls -1t "$STATE_DIR"/pre-rollback-*.sql.gz 2>/dev/null | tail -n +4 | while read -r old; do
+            rm -f "$old" || log "could not prune stale pre-rollback dump $old"
+        done
     else
         fail "could not capture the pre-rollback database state — refusing to proceed"
     fi
 
     stage="database"
     log "restoring database (atomic, $EXPECT_TABLES tables expected)"
+    # The schema is torn down first, in the SAME transaction as the dump.
+    #
+    # `pg_dump --clean` only emits DROP statements for objects the dump itself
+    # contains, so before this, anything created AFTER the snapshot outlived a
+    # restore of it. That left a database that matched neither version: the newer
+    # version's tables were still present while `_sqlx_migrations` had been
+    # rewound to the older state, so a later forward update re-ran a migration
+    # whose objects already existed. MEASURED on a lab box: the api panicked at
+    # startup with `relation "..." already exists`, exited 101, and crash-looped
+    # under Restart=always until it hit StartLimitBurst — a permanent 502 from a
+    # rollback that had reported success. Dropping the schema makes a restore an
+    # actual point-in-time revert instead of a merge.
+    #
+    # Owner and ACL are restored explicitly because the dump carries neither: a
+    # bare CREATE SCHEMA would hand `public` to the restoring role and drop
+    # PUBLIC's USAGE grant, silently changing the database's permissions on every
+    # rollback. Verified to reproduce the original owner and ACL exactly.
+    #
+    # This is still all-or-nothing. The DROP is inside psql's --single-transaction,
+    # so a dump that fails to apply rolls the teardown back with it and the
+    # database is left exactly as it was. The pre-rollback dump taken above is the
+    # second line of defence.
+    # Assembled into a REGULAR FILE and fed to psql by redirection — never piped.
+    # A pipe would put a live producer back in front of psql, which is the whole
+    # defect this file exists to prevent: if the producer dies mid-stream psql
+    # sees a clean EOF, and --single-transaction then COMMITS a dropped schema
+    # plus half a dump. `set +e` below suppresses errexit but NOT pipefail, so the
+    # status would also be the producer's rather than psql's, and the "nothing
+    # changed" message below would be printed over a destroyed database. Same
+    # reason the dump itself is decompressed to a file at the verify-dump stage.
+    PREAMBLE_SQL="$WORK/db/preamble.sql"
+    APPLY_SQL="$WORK/db/apply.sql"
+    printf '%s\n' \
+        'DROP SCHEMA IF EXISTS public CASCADE;' \
+        'CREATE SCHEMA public;' \
+        'ALTER SCHEMA public OWNER TO pg_database_owner;' \
+        'GRANT USAGE ON SCHEMA public TO PUBLIC;' \
+        > "$PREAMBLE_SQL" || fail "could not stage the schema teardown — nothing changed"
+    cat "$PREAMBLE_SQL" "$DUMP_SQL" > "$APPLY_SQL" \
+        || fail "could not assemble the restore stream — nothing changed"
+    # Byte-exact, so a short write is caught before anything is destroyed rather
+    # than presented to psql as a complete input.
+    A_SZ="$(stat -c%s "$APPLY_SQL")"; P_SZ="$(stat -c%s "$PREAMBLE_SQL")"; D_SZ="$(stat -c%s "$DUMP_SQL")"
+    if [ "$A_SZ" != "$(( P_SZ + D_SZ ))" ]; then
+        fail "assembled restore stream is short ($A_SZ vs $(( P_SZ + D_SZ )) bytes) — nothing changed"
+    fi
     set +e
     docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" \
         -X -q -v ON_ERROR_STOP=1 --single-transaction \
-        < "$DUMP_SQL" > "$WORK/psql.out" 2> "$WORK/psql.err"
+        < "$APPLY_SQL" > "$WORK/psql.out" 2> "$WORK/psql.err"
     DB_RC=$?
     set -e
     if [ "$DB_RC" != "0" ]; then
@@ -219,10 +289,15 @@ if [ -f "$DUMP_SQL" ]; then
 
     # "psql exited 0" is not the success condition — the schema is (lesson #45).
     #
-    # A floor, not an equality: `pg_dump --clean` only drops what the dump itself
-    # contains, so any table created AFTER this snapshot survives the restore and
-    # the count can legitimately exceed the dump's. See the note on rollback
-    # semantics at the top of this file.
+    # Deliberately still a floor, even though the teardown now makes a surplus
+    # structurally impossible. This check runs AFTER the transaction has
+    # committed and BEFORE the binaries are reverted, so a `fail` here trips the
+    # exit trap, which restarts the still-installed NEWER api against the
+    # just-reverted database — and that api migrates it forward again, quietly
+    # undoing the rollback it is reporting as failed. A check that cannot be
+    # wrong in that window is worth more than a tighter one that can: an
+    # equality would trip on a table the dump creates outside `public`, or on
+    # any counting mismatch between the grep and the catalogue query.
     stage="database-verify"
     GOT_TABLES="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAq \
         -c "select count(*) from information_schema.tables where table_schema='public' and table_type='BASE TABLE'" 2>/dev/null | tr -d ' \r')"

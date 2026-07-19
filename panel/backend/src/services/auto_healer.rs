@@ -1100,14 +1100,44 @@ async fn run_retention_cleanup(pool: &PgPool) {
     // DB auto-backup: done via direct pg_dump (doesn't need agent client)
     if super::security_hardening::get_setting_bool(pool, "security_db_backup_enabled", true).await {
         tracing::info!("Triggering DockPanel DB auto-backup...");
-        match safe_command("sh")
+        // `bash` and `set -o pipefail` are both load-bearing (lesson #51). The exit
+        // status of `pg_dump | gzip` is *gzip's*, and gzip compresses a truncated
+        // stream and exits 0 — so under the previous `sh -c` (which is dash here,
+        // and has no pipefail) a pg_dump that died halfway was written out, this
+        // arm matched, and the healer logged "DB auto-backup completed" over a
+        // backup that could never be restored. Sibling of the panel_snapshot.rs
+        // dump fixed in v2.11.5; this call site was missed then.
+        let backup_file = format!(
+            "/var/backups/dockpanel/dockpanel-db-{}.sql.gz",
+            chrono::Utc::now().format("%Y%m%d_%H%M%S")
+        );
+        match safe_command("bash")
             .args(["-c", &format!(
-                "docker exec dockpanel-postgres pg_dump -U dockpanel dockpanel | gzip > /var/backups/dockpanel/dockpanel-db-{}.sql.gz",
-                chrono::Utc::now().format("%Y%m%d_%H%M%S")
+                "set -o pipefail; docker exec dockpanel-postgres pg_dump -U dockpanel dockpanel | gzip > {backup_file}"
             )])
             .output().await
         {
             Ok(o) if o.status.success() => {
+                // A zero exit is not the success condition — a whole dump is
+                // (lesson #51 rule 4). pg_dump emits this marker last, so its
+                // absence means the file is short whatever the statuses claimed.
+                // This gates the retention prune below on purpose: pruning to 7
+                // after writing a corrupt backup would evict a GOOD one to make
+                // room for a useless one.
+                let complete = safe_command("bash")
+                    .args(["-c", &format!("gunzip -c {backup_file} | tail -20")])
+                    .output().await
+                    .map(|t| String::from_utf8_lossy(&t.stdout)
+                        .contains("PostgreSQL database dump complete"))
+                    .unwrap_or(false);
+                if !complete {
+                    tracing::warn!(
+                        "DB auto-backup discarded: {backup_file} is incomplete \
+                         (completion marker absent) — keeping earlier backups"
+                    );
+                    let _ = std::fs::remove_file(&backup_file);
+                    return;
+                }
                 tracing::info!("DockPanel DB auto-backup completed");
                 // Cleanup old backups (keep 7)
                 if let Ok(entries) = std::fs::read_dir("/var/backups/dockpanel") {

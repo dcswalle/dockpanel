@@ -6,6 +6,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.7] - 2026-07-19
+
+### Fixed
+
+- **A rollback merged the snapshot into the database instead of replacing it,
+  and that made rolling back across a migration either impossible or fatal.**
+  `pg_dump --clean` emits `DROP` statements only for the objects the dump itself
+  contains, so anything a newer version's migration had created outlived a
+  rollback to an older snapshot — while `_sqlx_migrations`, which *is* in the
+  dump, was rewound past it. The database was left describing neither version.
+  Two distinct failures follow from that, both reproduced end to end on a lab
+  box before this was changed:
+  - For a migration that adds a **standalone** table, the rollback succeeded and
+    the *next* forward update to that version re-ran the migration against
+    objects that already existed: `relation "..." already exists`, the api
+    panicked at startup, exited 101 and crash-looped under `Restart=always`
+    until `StartLimitBurst` — a permanent 502 out of a rollback that had
+    reported success.
+  - For a migration that adds a table with a **foreign key** to an existing one
+    — 7 of the 15 newest migrations reference `users`/`servers`/`sites` — the
+    rollback could not even run: the surviving FK depends on `users_pkey`, none
+    of the dump's `DROP TABLE` statements carry `CASCADE`, and psql aborted with
+    `cannot drop constraint users_pkey ... because other objects depend on it`.
+    Atomic, so nothing was lost — but the snapshot could never be restored.
+
+  The database stage now drops and recreates the `public` schema in the **same
+  transaction** as the dump, making a rollback a true point-in-time revert. The
+  schema's owner and ACL are restored explicitly (`pg_database_owner`, plus
+  `PUBLIC`'s `USAGE`), because the dump carries neither and a bare recreate would
+  have silently handed the schema to the restoring role on every rollback. The
+  all-or-nothing guarantee is unchanged: the teardown shares the dump's
+  transaction, so a dump that fails to apply rolls it back and the database is
+  byte-identical afterwards. The pre-rollback dump is still taken first.
+
+  No released version pair could reach this: the newest migration
+  (`20260520000000_panel_self_update.sql`) shipped in v2.10.0, so every version
+  from v2.10.0 to v2.11.6 has an identical migration set. The defect became
+  reachable the moment the next migration shipped.
+
+- **`pg_dump | gzip` reported gzip's exit status in two more places.** v2.11.5
+  fixed this for panel snapshots and missed its siblings. The auto-healer's
+  24-hourly database backup ran under `sh -c` — dash, which has no `pipefail` —
+  so a `pg_dump` that died halfway was stored and logged as "DB auto-backup
+  completed"; and the `db-backup.sh` written by `setup.sh` checked no status at
+  all. Both now run with `pipefail` and verify the dump's completion marker
+  before the file is kept. In both, retention pruning now happens only *after*
+  the new backup is known good, so a corrupt run can no longer evict a good one.
+  (`scripts/update.sh`'s pre-upgrade backup was already covered by that script's
+  file-level `set -o pipefail`.)
+
+- **Backup verification could pass on a partially applied restore.**
+  `backup_verify.rs` restored into its scratch database with neither
+  `ON_ERROR_STOP=1` nor `--single-transaction`, so a dump whose statements failed
+  still produced tables for the table-count check to find and report "verified".
+  `backup_drill.rs` had `ON_ERROR_STOP=1` but not `--single-transaction`, so a
+  drill could still describe a partial restore. Both now restore atomically.
+  These dumps are written with `--no-owner --no-acl` and no `--clean`, so there
+  are no `DROP` statements to fail spuriously against a fresh scratch database.
+
+- **The dump-completeness check had no margin left.** Both copies looked for
+  `PostgreSQL database dump complete` in the last 5 lines, but PostgreSQL's
+  August-2025 minor releases append a trailing `\unrestrict` line: on the lab the
+  marker landed at line 6243 of 6247, inside the window by exactly zero lines.
+  One more trailer from any future `pg_dump` and every snapshot would have been
+  rejected as truncated, disabling rollback entirely. The window is now 20 lines.
+  It stays a tail window rather than a whole-file search on purpose — this panel
+  stores operator-authored text, so the marker string can legitimately appear in
+  the data.
+
+### Changed
+
+- **Behaviour change, stated plainly: a rollback now DELETES database objects
+  created after the snapshot, and the data in them.** Previously they survived,
+  which is what made the panel unbootable afterwards. The pre-rollback dump is
+  the way back, and it is taken before anything is touched.
+- Pre-rollback dumps (`/var/lib/dockpanel/pre-rollback-<id>.sql.gz`) are now
+  pruned to the three most recent. One is written on every rollback and nothing
+  in the product had ever deleted them — the retention sweep only walks
+  `panel_snapshots` rows and their tarballs — so they grew without bound, which
+  matters more now that they are the only undo for the deletion above.
+- Settings → Telemetry now states what a rollback actually removes before the
+  operator confirms it, and `docs/api-reference.md` describes the replace
+  semantics rather than the old merge semantics.
+
 ## [2.11.6] - 2026-07-19
 
 ### Added
@@ -84,13 +168,13 @@ not by reading it.
 
 ### Known issues
 
-- A rollback restores what the snapshot *contains*. Because `pg_dump --clean`
-  can only drop objects it knows about, database objects created *after* a
-  snapshot survive a rollback to it while `_sqlx_migrations` is rewound — so a
-  later forward update to that same newer version can meet a migration whose
-  objects already exist. Nothing outside the snapshot (nginx vhosts, Let's
-  Encrypt certificates, site data, docker volumes) is rewound at all: a rollback
-  restores the panel, not the machine.
+- **RESOLVED in 2.11.7.** A rollback restores what the snapshot *contains*.
+  Because `pg_dump --clean` can only drop objects it knows about, database
+  objects created *after* a snapshot survive a rollback to it while
+  `_sqlx_migrations` is rewound — so a later forward update to that same newer
+  version can meet a migration whose objects already exist. Nothing outside the
+  snapshot (nginx vhosts, Let's Encrypt certificates, site data, docker volumes)
+  is rewound at all: a rollback restores the panel, not the machine.
 
 ## [2.11.4] - 2026-07-19
 

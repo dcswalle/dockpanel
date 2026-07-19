@@ -258,7 +258,12 @@ async fn build_snapshot_inner(
     let dump_tail = Command::new("bash")
         .arg("-c")
         .arg(format!(
-            "gunzip -c {} | tail -5",
+            // Wider than the marker's current position on purpose — see the same
+            // check in restore-snapshot.sh. A trailing `\unrestrict` line added by
+            // PostgreSQL's August-2025 minors left the marker 5 lines from the end
+            // with zero margin; one more trailer and every snapshot would be
+            // rejected as incomplete at creation time.
+            "gunzip -c {} | tail -20",
             shell_escape(&dump_path.to_string_lossy())
         ))
         .output()
@@ -711,6 +716,113 @@ mod tests {
         assert!(
             RESTORE_SCRIPT.contains("--single-transaction"),
             "restore script must apply the dump in one transaction so a failure changes nothing"
+        );
+    }
+
+    /// A rollback must REPLACE the database, not merge into it.
+    ///
+    /// `pg_dump --clean` drops only what the dump contains, so without an
+    /// explicit teardown a table created by a newer version's migration outlived
+    /// a rollback while `_sqlx_migrations` was rewound past it. The next forward
+    /// update then re-ran that migration against objects that already existed,
+    /// the api panicked at startup and crash-looped into a permanent 502.
+    /// Reproduced end to end on a lab box before this teardown was added.
+    #[test]
+    fn restore_script_rebuilds_the_schema_instead_of_merging_into_it() {
+        assert!(
+            RESTORE_SCRIPT.contains("DROP SCHEMA IF EXISTS public CASCADE;"),
+            "a restore that cannot remove post-snapshot objects is a merge, not a rollback"
+        );
+        assert!(
+            RESTORE_SCRIPT.contains("CREATE SCHEMA public;"),
+            "the schema must be recreated after being dropped"
+        );
+    }
+
+    /// The teardown carries the schema's owner and ACL back with it. The dump
+    /// contains no GRANT/REVOKE and no CREATE SCHEMA, so a bare recreate would
+    /// hand `public` to the restoring role and silently drop PUBLIC's USAGE
+    /// grant — changing the database's permissions on every rollback.
+    #[test]
+    fn restore_script_preserves_schema_ownership_and_grants() {
+        assert!(
+            RESTORE_SCRIPT.contains("ALTER SCHEMA public OWNER TO pg_database_owner;"),
+            "recreating public without restoring its owner changes it on every rollback"
+        );
+        assert!(
+            RESTORE_SCRIPT.contains("GRANT USAGE ON SCHEMA public TO PUBLIC;"),
+            "recreating public without restoring PUBLIC's USAGE grant revokes it silently"
+        );
+    }
+
+    /// psql must never be fed by a pipe.
+    ///
+    /// A live producer in front of psql is the original defect in a new costume:
+    /// if it dies mid-stream psql sees a clean EOF, and `--single-transaction`
+    /// then COMMITS whatever arrived — with the teardown that means a dropped
+    /// schema plus half a dump, while the pipeline's non-zero status makes the
+    /// script report "nothing changed". This was written as a pipe first and
+    /// caught in review; the pin is here so it cannot come back.
+    #[test]
+    fn restore_script_never_feeds_psql_from_a_pipe() {
+        for (i, line) in RESTORE_SCRIPT.lines().enumerate() {
+            let l = line.trim_start();
+            if l.starts_with('#') {
+                continue;
+            }
+            let Some(psql_at) = l.find("psql") else { continue };
+            // Only a pipe that FEEDS psql matters. Piping psql's own output into
+            // `tr` is how several checks below read a scalar, and is fine.
+            let piped_into = l
+                .match_indices('|')
+                .filter(|(at, _)| !l[*at..].starts_with("||"))
+                .any(|(at, _)| at < psql_at);
+            assert!(
+                !piped_into,
+                "line {} pipes into psql; feed it from a file by redirection: {l}",
+                i + 1
+            );
+        }
+        assert!(
+            RESTORE_SCRIPT.contains("< \"$APPLY_SQL\""),
+            "the assembled restore stream must reach psql by redirection"
+        );
+    }
+
+    /// Destroying the schema is only safe because the dump has already been
+    /// proven whole. If these ever swap order, a truncated dump would take the
+    /// database with it.
+    #[test]
+    fn restore_script_proves_the_dump_before_it_drops_the_schema() {
+        let verified = RESTORE_SCRIPT
+            .find("PostgreSQL database dump complete")
+            .expect("dump completion marker must be checked");
+        let dropped = RESTORE_SCRIPT
+            .find("DROP SCHEMA IF EXISTS public CASCADE;")
+            .expect("schema teardown must exist");
+        assert!(
+            verified < dropped,
+            "the dump must be proven complete before the schema is torn down"
+        );
+    }
+
+    /// One transaction, not two. The teardown and the dump must commit or roll
+    /// back together — a separate psql for the DROP would leave a dropped schema
+    /// behind if the dump then failed, turning a safe failure into total loss.
+    ///
+    /// Counts only executable lines: this file explains itself at length, and a
+    /// pin that counts prose fails the moment someone documents the thing it
+    /// pins.
+    #[test]
+    fn restore_script_tears_down_and_reloads_in_a_single_transaction() {
+        let executable_uses = RESTORE_SCRIPT
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.contains("--single-transaction"))
+            .count();
+        assert_eq!(
+            executable_uses, 1,
+            "the schema teardown must share the dump's transaction, not run in its own"
         );
     }
 

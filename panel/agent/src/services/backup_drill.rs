@@ -423,7 +423,13 @@ async fn run_postgres_drill(
                             "-e", &format!("PGPASSWORD={password}"),
                             container_name,
                             "psql", "-U", "drill", "-d", db_name, "--quiet",
-                            "-v", "ON_ERROR_STOP=1",
+                            // ON_ERROR_STOP alone stops at the first failed
+                            // statement but leaves everything before it applied,
+                            // so the drill's table/row counts below could still
+                            // describe a partial restore. --single-transaction
+                            // makes the drill an all-or-nothing rehearsal of the
+                            // real thing (lesson #51).
+                            "-v", "ON_ERROR_STOP=1", "--single-transaction",
                         ])
                         .stdin(stdout.into_owned_fd().unwrap())
                         .output(),

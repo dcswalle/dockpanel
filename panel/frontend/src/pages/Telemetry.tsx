@@ -866,7 +866,11 @@ export default function Telemetry() {
                       </div>
                       {isRollback ? (
                         <Fragment>
-                          <span className="text-xs text-amber-400">Destructive — DB will be restored.</span>
+                          <span className="text-xs text-amber-400">
+                            Destructive — the database is reverted to this snapshot. Anything
+                            created since (including tables added by a newer version) is removed.
+                            A copy of the current database is saved first.
+                          </span>
                           <button onClick={() => setRollbackConfirm(null)}
                             className="px-2 py-1 bg-dark-700 hover:bg-dark-600 text-dark-300 border border-dark-600 rounded text-xs">
                             Cancel

@@ -1087,11 +1087,29 @@ setup_db_backup() {
 
     cat > "$BACKUP_SCRIPT" << 'BKEOF'
 #!/bin/bash
+# pipefail is load-bearing: the exit status of `pg_dump | gzip` is *gzip's*, and
+# gzip compresses a truncated stream and exits 0. Without it a pg_dump that died
+# halfway was written out as the day's backup, the retention sweep below then
+# deleted a good older one to make room, and nothing anywhere said a word.
+set -o pipefail
 BACKUP_DIR="/var/backups/dockpanel/db"
 mkdir -p "$BACKUP_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-docker exec dockpanel-postgres pg_dump -U dockpanel -d dockpanel | gzip > "$BACKUP_DIR/dockpanel_$TIMESTAMP.sql.gz"
-# Keep last 7 days
+OUT="$BACKUP_DIR/dockpanel_$TIMESTAMP.sql.gz"
+if ! docker exec dockpanel-postgres pg_dump -U dockpanel -d dockpanel | gzip > "$OUT"; then
+    echo "dockpanel db-backup: pg_dump failed, discarding $OUT" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+# A zero exit is not the success condition — a whole dump is. pg_dump emits this
+# marker near the end; its absence means the file is short whatever exited 0.
+if ! gunzip -c "$OUT" | tail -20 | grep -q 'PostgreSQL database dump complete'; then
+    echo "dockpanel db-backup: $OUT is incomplete, discarding" >&2
+    rm -f "$OUT"
+    exit 1
+fi
+# Keep last 7 days — only ever reached once today's backup is known good, so a
+# bad run can never evict a good one.
 find "$BACKUP_DIR" -name "*.sql.gz" -mtime +7 -delete
 BKEOF
     chmod +x "$BACKUP_SCRIPT"

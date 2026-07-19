@@ -377,6 +377,16 @@ async fn verify_postgres_restore(
                                 "-e", &format!("PGPASSWORD={password}"),
                                 container_name,
                                 "psql", "-U", "verify", "-d", db_name, "--quiet",
+                                // Without these, psql reports success for a dump
+                                // whose statements failed, and leaves the partial
+                                // result behind — so a truncated backup that still
+                                // produced *some* tables passes the table-count
+                                // check below and is reported "verified" (lesson
+                                // #51). The dumps restored here are written by
+                                // database_backup.rs with --no-owner --no-acl and
+                                // no --clean, so there are no DROP statements to
+                                // fail spuriously against this fresh scratch DB.
+                                "-v", "ON_ERROR_STOP=1", "--single-transaction",
                             ])
                             .stdin(stdout.into_owned_fd().unwrap())
                             .output(),

@@ -821,12 +821,24 @@ nothing at all. The same document is written to
 `/var/lib/dockpanel/last-restore.json` on the box.
 
 **What a rollback does and does not rewind.** It restores what the snapshot
-contains: the three binaries, `/etc/dockpanel`, and the database. Because the
-dump can only drop objects it knows about, database objects created *after* the
-snapshot survive the rollback. Nothing outside the snapshot — nginx vhosts,
-Let's Encrypt certificates, site files, docker volumes — is touched. A rollback
-restores the panel, not the machine. The pre-rollback database is saved to
-`/var/lib/dockpanel/pre-rollback-<id>.sql.gz` first.
+contains: the three binaries, `/etc/dockpanel`, and the database. The database is
+a true point-in-time revert — the `public` schema is dropped and rebuilt from the
+dump in a single transaction — so database objects created *after* the snapshot
+do **not** survive it, and neither does data written into them. The database as it
+stood immediately before the rollback is dumped first to
+`/var/lib/dockpanel/pre-rollback-<id>.sql.gz` (mode `0600`), which is the way
+back from a rollback you did not mean; the three most recent are kept and older
+ones are pruned. Nothing outside the snapshot — nginx vhosts, Let's Encrypt
+certificates, site files, docker volumes — is touched. A rollback restores the
+panel, not the machine.
+
+Up to and including v2.11.6 the database stage applied only the dump's own `DROP`
+statements, which merged the snapshot into whatever was already there: tables
+added by a newer version's migration outlived the rollback while
+`_sqlx_migrations` was rewound past them, and a subsequent update back to that
+version re-ran the migration against objects that already existed, leaving the
+panel in a startup crash loop. Rolling back with v2.11.7 or newer replaces the
+schema outright and is unaffected.
 
 Agent-side (called by the orchestrator over the agent's bearer-auth API):
 
