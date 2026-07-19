@@ -9,6 +9,26 @@
 #
 set -euo pipefail
 
+# ── Escape the caller's service cgroup ────────────────────────────────────
+# When the panel triggers an update it spawns this script from inside
+# dockpanel-api.service. That unit is KillMode=control-group (the systemd
+# default), so the `systemctl stop dockpanel-agent dockpanel-api` further down
+# SIGTERMs every process in the cgroup — including this script, one line before
+# it swaps the binaries. The box is then left with both services stopped and the
+# old binaries still in place. Setting a POSIX process group (which the
+# orchestrator does) does not help: systemd kills by cgroup, not process group.
+#
+# Re-exec into a transient scope so we live outside the unit being stopped.
+# Harmless for the normal SSH invocation — that cgroup never matches.
+if [ -z "${DOCKPANEL_UPDATE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&1; then
+    if grep -qE 'dockpanel-(api|agent)\.service' /proc/self/cgroup 2>/dev/null; then
+        export DOCKPANEL_UPDATE_DETACHED=1
+        echo "[+] Re-executing outside the panel's service cgroup..."
+        exec systemd-run --quiet --collect --scope --description="DockPanel self-update" \
+            bash "$0" "$@"
+    fi
+fi
+
 # ── Colors ────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
