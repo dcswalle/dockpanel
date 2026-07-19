@@ -176,11 +176,12 @@ sect "Admin Rotate Cert Pin"
 # so we can exercise the gate by passing it as a cookie without the
 # X-Requested-With header.
 #
-# Note: for admin-only routes like this one, AdminUser::from_request_parts
-# wraps the underlying AuthUser error — including the CSRF 403 — as 401
-# ("Authentication required"). So the observable status for the blocked
-# case is 401, not 403. The delta vs. the "with header" request below
-# (200) is what proves the gate fired.
+# Note: AdminUser::from_request_parts used to flatten the underlying
+# AuthUser error — including the CSRF 403 — into a generic 401
+# ("Authentication required"). Since v2.11.2 it propagates the inner
+# rejection, so the blocked case surfaces as 403 ("Missing CSRF header").
+# Both are accepted below so this test spans either behaviour; the delta
+# vs. the "with header" request (200) is what proves the gate fired.
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
     "$API/api/servers/$TEST_SERVER_ID/rotate-cert-pin" \
     -H "Cookie: token=$BEARER_TOKEN" 2>/dev/null)

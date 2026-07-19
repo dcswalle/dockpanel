@@ -113,9 +113,11 @@ impl FromRequestParts<AppState> for AdminUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let AuthUser(claims) = AuthUser::from_request_parts(parts, state)
-            .await
-            .map_err(|_| err(StatusCode::UNAUTHORIZED, "Authentication required"))?;
+        // Propagate the inner rejection verbatim — flattening it to a generic
+        // 401 hid "Missing CSRF header" (403) and "Invalid or expired token"
+        // behind "Authentication required" on every admin endpoint, which sends
+        // clients debugging a stale session instead of the real cause.
+        let AuthUser(claims) = AuthUser::from_request_parts(parts, state).await?;
 
         if claims.role != "admin" {
             return Err(err(StatusCode::FORBIDDEN, "Admin access required"));
@@ -136,9 +138,8 @@ impl FromRequestParts<AppState> for ResellerUser {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let AuthUser(claims) = AuthUser::from_request_parts(parts, state)
-            .await
-            .map_err(|_| err(StatusCode::UNAUTHORIZED, "Authentication required"))?;
+        // Same rationale as AdminUser: keep the inner rejection intact.
+        let AuthUser(claims) = AuthUser::from_request_parts(parts, state).await?;
 
         if claims.role != "admin" && claims.role != "reseller" {
             return Err(err(StatusCode::FORBIDDEN, "Admin or reseller access required"));

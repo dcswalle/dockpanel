@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.2] - 2026-07-19
+
+Fresh-VPS validation release. Every fix below came out of running the panel
+on two clean boxes — Ubuntu 24.04 and Debian 12 — rather than reading code:
+the PowerDNS installer shipped in 2.11.0 could not actually bring the service
+up on Ubuntu, and its PostgreSQL backend had never worked on any install.
+
+### Fixed
+
+- **PowerDNS never started on Ubuntu (and any distro running
+  systemd-resolved).** The generated `pdns.conf` set no `local-address`, so
+  pdns took its default wildcard `0.0.0.0:53` bind — which collides with the
+  systemd-resolved stub listeners on `127.0.0.53` and `127.0.0.54`. pdns died
+  with `Unable to bind UDP socket to '0.0.0.0:53': Address already in use` and
+  systemd restart-looped it indefinitely. The installer now detects a foreign
+  listener on port 53 and pins pdns to the machine's real addresses plus
+  loopback, leaving the stub resolver — and the box's own name resolution —
+  untouched. Debian 12 ships no stub listener, keeps the wildcard bind, and is
+  why this never showed up in CI.
+- **Reinstalling PowerDNS failed with `Read-only file system`.** Uninstall runs
+  `apt-get purge`, which deletes `/etc/powerdns`. systemd creates that directory
+  and its `ReadWritePaths` bind mount when the agent starts, so deleting it
+  detaches the mount for the rest of the agent's life and every later install
+  failed writing `pdns.conf`. The config is now written through the same
+  unsandboxed escape hatch already used for the SQLite schema, staged via a
+  live `ReadWritePaths` entry.
+- **The PowerDNS PostgreSQL backend could never connect.** The installer looked
+  for `PANEL_DB_PASSWORD`/`DATABASE_URL` in the agent's environment — which the
+  agent unit does not set — and then silently *generated a random password*,
+  guaranteeing `password authentication failed for user "dockpanel"`. It now
+  reads the real credential from `/etc/dockpanel/api.env`, and reports an error
+  instead of inventing one that cannot work.
+- **The PowerDNS installer reported success when pdns never started.** Both
+  `systemctl` results were discarded, so a crash-looping service still returned
+  `ok: true` and a green "PowerDNS installed" step. It now waits for the service
+  to settle and returns the failing journal line. This silence is why the three
+  bugs above shipped unnoticed.
+- **Taking a manual panel snapshot blocked self-update for 15 minutes.** The
+  in-flight probe matched any snapshot with no `to_version`, which includes
+  every manual snapshot — so `GET /api/update/status` reported a phantom
+  `in_flight` and `start_panel_update` refused with "already in flight". Taking
+  a safety snapshot before updating is exactly when an operator hits this. Both
+  queries now exclude manual snapshots.
+- **Admin endpoints reported CSRF and token errors as "Authentication
+  required".** The `AdminUser`/`ResellerUser` extractors flattened the inner
+  rejection into a generic 401, hiding the 403 "Missing CSRF header" and
+  "Invalid or expired token" cases behind a misleading message.
+- **The `pdns.conf` API key was world-readable** (mode 644). It is now installed
+  `640 root:pdns`.
+
+### Changed
+
+- The install smoke-test — the ABI/loader regression guard for #70 — is now
+  invoked from the release workflow. It declared `on: release: [published]`,
+  but releases are published with the default `GITHUB_TOKEN`, which by design
+  does not start further workflow runs; the guard had therefore never run on
+  a release since it was written.
+- `npm audit` and `cargo audit` now run as a blocking pre-push gate across all
+  six manifests, and the git hooks are checked into `scripts/hooks/` instead of
+  living only in one machine's `.git/hooks`. Every audit step in CI is suffixed
+  `|| true`, so this is the project's first enforcing dependency check.
+- The manual PowerDNS setup guide in Settings → Services documents the
+  systemd-resolved port-53 conflict and the `local-address` line that resolves
+  it.
+
 ## [2.11.1] - 2026-07-19
 
 Dependency-security release. No feature changes and no application source

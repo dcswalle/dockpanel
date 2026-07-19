@@ -180,3 +180,12 @@ jobs:
           generate_release_notes: true
           files: |
             release/*
+
+  # The #70 ABI/loader guard. It has to be called from here: publishing with the
+  # default GITHUB_TOKEN does not raise a `release: published` event that can
+  # start another workflow, so smoke-test.yml's own trigger never fires.
+  smoke-test:
+    needs: release
+    uses: ./.github/workflows/smoke-test.yml
+    with:
+      tag: ${{ github.ref_name }}

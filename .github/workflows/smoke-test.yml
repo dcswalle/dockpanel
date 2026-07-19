@@ -15,7 +15,20 @@ name: Install smoke-test
 # is the separate fresh-VPS gate. Covers amd64 + the apt-based distros that span
 # the glibc floor (Debian 11 / Ubuntu 20.04 = glibc 2.31) up to the newest.
 
+# NOTE ON TRIGGERS: `release: [published]` alone never fires this workflow.
+# release.yml publishes with the default GITHUB_TOKEN, and GitHub deliberately
+# does not start new workflow runs from events raised by that token (recursion
+# guard). Between the workflow landing and 2026-07-19 it had therefore only ever
+# run via workflow_dispatch — the #70 regression guard was inert for v2.10.2,
+# v2.11.0 and v2.11.1. `workflow_call` is what actually wires it in: release.yml
+# invokes it as a dependent job once the assets are published.
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag to test'
+        required: true
+        type: string
   release:
     types: [published]
   workflow_dispatch:
@@ -24,6 +37,7 @@ on:
         description: 'Release tag to test (blank = latest)'
         required: false
         default: ''
+        type: string
 
 permissions:
   contents: read
@@ -39,10 +53,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          if [ -n "${{ github.event.release.tag_name }}" ]; then
+          # `inputs.tag` covers both workflow_call and workflow_dispatch.
+          if [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [ -n "${{ github.event.release.tag_name }}" ]; then
             TAG="${{ github.event.release.tag_name }}"
-          elif [ -n "${{ github.event.inputs.tag }}" ]; then
-            TAG="${{ github.event.inputs.tag }}"
           else
             TAG="$(gh release view --repo '${{ github.repository }}' --json tagName -q .tagName)"
           fi

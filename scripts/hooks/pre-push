@@ -1,0 +1,186 @@
+#!/bin/bash
+# DockPanel pre-push hook: secrets scan + build verification
+# This is the last line of defense before code reaches GitHub.
+
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+FOUND=0
+
+echo "=== Pre-push: secrets scan ==="
+
+# Scan the diff being pushed (all commits not yet on remote)
+REMOTE="$1"
+URL="$2"
+
+while read LOCAL_REF LOCAL_SHA REMOTE_REF REMOTE_SHA; do
+  if [ "$REMOTE_SHA" = "0000000000000000000000000000000000000000" ]; then
+    # New branch — scan all commits
+    RANGE="$LOCAL_SHA"
+  else
+    RANGE="$REMOTE_SHA..$LOCAL_SHA"
+  fi
+
+  # Get the full diff being pushed
+  DIFF=$(git diff "$RANGE" -- '*.rs' '*.ts' '*.tsx' '*.sql' '*.toml' '*.sh' '*.json' '*.yml' '*.yaml' 2>/dev/null)
+
+  if [ -z "$DIFF" ]; then
+    continue
+  fi
+
+  # Secrets patterns
+  if echo "$DIFF" | grep -qiE 'PTHEsBzagJBWE8NuJjA|dockpanel2026|github_pat_|ARYXXLI'; then
+    echo -e "${RED}BLOCKED: Secret/token found in commits being pushed${NC}"
+    echo "$DIFF" | grep -niE 'PTHEsBzagJBWE8NuJjA|dockpanel2026|github_pat_|ARYXXLI' | head -5
+    FOUND=1
+  fi
+
+  # Password assignments in source code
+  if echo "$DIFF" | grep -E '^\+' | grep -qiE 'password\s*=\s*"[^"]{6,}"'; then
+    HITS=$(echo "$DIFF" | grep -E '^\+' | grep -iE 'password\s*=\s*"[^"]{6,}"' | grep -viE 'wp_password|nc_password|example|placeholder|changeme|default|_password"|PASSWORD_HASH')
+    if [ -n "$HITS" ]; then
+      echo -e "${YELLOW}WARNING: Possible hardcoded password in pushed code:${NC}"
+      echo "$HITS" | head -3
+      # Warning only — too many false positives with template defaults
+    fi
+  fi
+
+  # Real IPs
+  if echo "$DIFF" | grep -qE '95\.179\.144\.140|45\.32\.232\.132|136\.244\.102\.195|78\.141\.211\.78|192\.168\.1\.186'; then
+    echo -e "${RED}BLOCKED: Real infrastructure IP in commits being pushed${NC}"
+    echo "$DIFF" | grep -nE '95\.179\.144\.140|45\.32\.232\.132|136\.244\.102\.195|78\.141\.211\.78|192\.168\.1\.186' | head -5
+    FOUND=1
+  fi
+
+  # Check for .env/.pem/.key files in the push
+  SENSITIVE_FILES=$(git diff --name-only "$RANGE" 2>/dev/null | grep -E '\.(env|pem|key)$' | grep -v '.sample')
+  if [ -n "$SENSITIVE_FILES" ]; then
+    echo -e "${RED}BLOCKED: Sensitive file in push: ${SENSITIVE_FILES}${NC}"
+    FOUND=1
+  fi
+done
+
+if [ "$FOUND" -eq 1 ]; then
+  echo -e "${RED}Push blocked. Remove sensitive data, amend/rebase, then retry.${NC}"
+  exit 1
+fi
+
+# Build verification check — BLOCKING
+if [ -f "panel/frontend/dist/index.html" ]; then
+  FRONTEND_MTIME=$(stat -c %Y panel/frontend/dist/index.html 2>/dev/null || echo 0)
+  LATEST_SRC=$(find panel/frontend/src \( -name '*.tsx' -o -name '*.ts' \) -newer panel/frontend/dist/index.html 2>/dev/null | head -1)
+  if [ -n "$LATEST_SRC" ]; then
+    echo -e "${RED}BLOCKED: Frontend source is newer than built dist/. Run 'npm run build' first.${NC}"
+    echo -e "${RED}  Stale file: ${LATEST_SRC}${NC}"
+    FOUND=1
+  fi
+fi
+
+# Version consistency check — BLOCKING
+echo ""
+echo "=== Version consistency check ==="
+V_AGENT=$(grep '^version' panel/agent/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
+V_BACKEND=$(grep '^version' panel/backend/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
+V_CLI=$(grep '^version' panel/cli/Cargo.toml 2>/dev/null | head -1 | sed 's/.*"\(.*\)"/\1/')
+V_FRONTEND=$(grep '"version"' panel/frontend/package.json 2>/dev/null | head -1 | sed 's/.*: *"\(.*\)".*/\1/')
+
+if [ -n "$V_AGENT" ] && [ -n "$V_BACKEND" ] && [ -n "$V_CLI" ] && [ -n "$V_FRONTEND" ]; then
+  if [ "$V_AGENT" != "$V_BACKEND" ] || [ "$V_AGENT" != "$V_CLI" ] || [ "$V_AGENT" != "$V_FRONTEND" ]; then
+    echo -e "${RED}BLOCKED: Version mismatch across packages:${NC}"
+    echo -e "  agent:    ${V_AGENT}"
+    echo -e "  backend:  ${V_BACKEND}"
+    echo -e "  cli:      ${V_CLI}"
+    echo -e "  frontend: ${V_FRONTEND}"
+    FOUND=1
+  else
+    echo -e "${GREEN}Versions consistent: ${V_AGENT}${NC}"
+  fi
+fi
+
+# Dependency audit — BLOCKING
+# v2.11.1 cleared 33 Dependabot advisories + 4 RustSec findings Dependabot never
+# surfaced. They piled up over ~4 releases because nothing ever failed loudly:
+# every audit step in .github/workflows/ci.yml is suffixed `|| true`, and CI does
+# not audit website/server at all. This is the first enforcing dependency check.
+echo ""
+echo "=== Dependency audit ==="
+
+# Both npm and cargo exit non-zero when they cannot reach their advisory source,
+# which is indistinguishable from a real finding by exit code alone. Sniff the
+# output and fail OPEN on a network error — a gate that blocks on a DNS blip is
+# a gate that gets disabled.
+for DIR in panel/frontend website/client website/server; do
+  [ -f "$DIR/package.json" ] || continue
+  OUT=$( (cd "$DIR" && npm audit --audit-level=high) 2>&1 )
+  if [ $? -eq 0 ]; then
+    echo -e "${GREEN}npm audit clean: ${DIR}${NC}"
+  elif echo "$OUT" | grep -qiE 'audit endpoint returned an error|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network'; then
+    echo -e "${YELLOW}WARNING: npm audit could not reach the registry for ${DIR} — not enforced${NC}"
+  else
+    echo -e "${RED}BLOCKED: npm audit found high/critical advisories in ${DIR}${NC}"
+    echo "$OUT" | grep -iE 'severity|vulnerabilities' | head -5
+    FOUND=1
+  fi
+done
+
+# cargo-audit lives in ~/.cargo/bin, which is not on a git hook's PATH.
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+if command -v cargo-audit >/dev/null 2>&1; then
+  # The three crates have separate Cargo.lock files — none is redundant.
+  # `-n` uses the cached RustSec DB (fast + offline-safe); fall back to a
+  # fetching run when the DB has never been cloned.
+  NOFETCH="-n"
+  [ -d "$HOME/.cargo/advisory-db" ] || NOFETCH=""
+  for CRATE in panel/agent panel/backend panel/cli; do
+    [ -f "$CRATE/Cargo.lock" ] || continue
+    OUT=$( (cd "$CRATE" && cargo audit $NOFETCH) 2>&1 )
+    if [ $? -eq 0 ]; then
+      echo -e "${GREEN}cargo audit clean: ${CRATE}${NC}"
+    elif echo "$OUT" | grep -qiE "couldn't fetch|failed to fetch|network|could not resolve"; then
+      echo -e "${YELLOW}WARNING: cargo audit could not reach the advisory DB for ${CRATE} — not enforced${NC}"
+    else
+      echo -e "${RED}BLOCKED: cargo audit found vulnerabilities in ${CRATE}${NC}"
+      echo "$OUT" | grep -iE '^error|RUSTSEC|Vulnerability' | head -8
+      FOUND=1
+    fi
+  done
+else
+  echo -e "${YELLOW}WARNING: cargo-audit not installed — Rust advisories NOT checked${NC}"
+  echo -e "${YELLOW}  → cargo install cargo-audit${NC}"
+fi
+
+if [ "$FOUND" -eq 1 ]; then
+  echo -e "${RED}Push blocked. Fix issues above then retry.${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}All pre-push checks passed.${NC}"
+
+# ─── Post-push reminders (warnings only, don't block) ───
+
+echo ""
+echo "=== Post-push gate reminders ==="
+
+# Check if website/ or docs/ changed — remind to deploy
+CHANGED_FILES=$(git diff --name-only "$RANGE" 2>/dev/null)
+if echo "$CHANGED_FILES" | grep -qE '^website/|^docs/'; then
+  echo -e "${YELLOW}REMINDER: website/ or docs/ changed — deploy live sites after push${NC}"
+  echo -e "${YELLOW}  → dockpanel.dev and/or docs.dockpanel.dev need rebuild${NC}"
+fi
+
+# Check if panel/ source changed — remind about release binaries
+if echo "$CHANGED_FILES" | grep -qE '^panel/(agent|backend|cli)/src/'; then
+  LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
+  if [ -n "$LATEST_TAG" ]; then
+    COMMITS_SINCE=$(git rev-list "$LATEST_TAG..HEAD" --count 2>/dev/null)
+    if [ "$COMMITS_SINCE" -gt 0 ]; then
+      echo -e "${YELLOW}REMINDER: panel/ source changed ($COMMITS_SINCE commits since $LATEST_TAG) — release binaries may be stale${NC}"
+    fi
+  fi
+fi
+
+# Remind about memory update
+echo -e "${YELLOW}REMINDER: update memory files (dev_history, polish_tracker, etc.)${NC}"
+
+exit 0

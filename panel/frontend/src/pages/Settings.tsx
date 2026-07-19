@@ -2509,6 +2509,8 @@ webserver=yes
 webserver-address=127.0.0.1
 webserver-port=8081
 webserver-allow-from=127.0.0.1`}</pre>
+              <p className="text-xs text-dark-300">On Ubuntu (and anywhere <span className="font-mono text-dark-200">systemd-resolved</span> is running) port 53 is already taken by the stub resolver on <span className="font-mono text-dark-200">127.0.0.53</span>, so PowerDNS's default wildcard bind fails with <span className="font-mono text-dark-200">Address already in use</span> and the service restart-loops. Add a <span className="font-mono text-dark-200">local-address</span> line listing your real IPs — the one-click installer detects this and does it for you:</p>
+              <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`local-address=YOUR.PUBLIC.IP.HERE,127.0.0.1`}</pre>
               <p className="text-xs text-dark-300">Prefer PostgreSQL? DockPanel's database runs in the <span className="font-mono text-dark-200">dockpanel-postgres</span> container, not on localhost — so <span className="font-mono text-dark-200">sudo -u postgres createdb pdns</span> won't work. Use the one-click installer's PostgreSQL option (it creates the <span className="font-mono text-dark-200">pdns</span> database inside the container for you).</p>
               <p className="text-dark-200 font-medium">Then restart and verify:</p>
               <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`systemctl restart pdns

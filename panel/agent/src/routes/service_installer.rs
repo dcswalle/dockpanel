@@ -298,6 +298,169 @@ enabled = true
 
 // ── PowerDNS installer ──────────────────────────────────────────────────
 
+/// Addresses pdns should bind, or `None` to leave PowerDNS on its `0.0.0.0`
+/// default.
+///
+/// Ubuntu runs systemd-resolved, whose stub listeners own `127.0.0.53:53` and
+/// `127.0.0.54:53`. A wildcard bind therefore fails with EADDRINUSE and pdns
+/// crash-loops, so when port 53 is already spoken for we pin pdns to the real
+/// interface addresses and leave the stub resolver alone. Distros without a
+/// stub listener (Debian 12 ships none) keep the wildcard bind, which also
+/// keeps pdns listening on addresses added after install.
+async fn pdns_local_addresses() -> Option<String> {
+    // apt's postinst starts pdns with the stock config, so pdns may be holding
+    // :53 itself by now. Ignore its own sockets — only a *foreign* listener
+    // means the wildcard bind is unavailable.
+    let listeners = safe_command("ss").args(["-tulnpH", "sport", "=", ":53"]).output().await
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let busy = listeners
+        .lines()
+        .any(|l| !l.trim().is_empty() && !l.contains("pdns"));
+    if !busy {
+        return None;
+    }
+
+    let out = safe_command("ip").args(["-o", "addr", "show", "scope", "global"]).output().await.ok()?;
+    let mut addrs: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(3))
+        .filter_map(|cidr| cidr.split('/').next())
+        .map(str::to_string)
+        .collect();
+    if addrs.is_empty() {
+        return None;
+    }
+    // Loopback stays reachable for local tooling; 127.0.0.1 never collides with
+    // the stub listeners, which sit on .53/.54.
+    addrs.push("127.0.0.1".to_string());
+    Some(addrs.join(","))
+}
+
+/// The panel's PostgreSQL password, parsed out of the API's env file.
+///
+/// `setup.sh` writes `DATABASE_URL=postgresql://dockpanel:<pw>@127.0.0.1:<port>/dockpanel`
+/// to `/etc/dockpanel/api.env` (mode 600, and the agent runs as root). Env vars
+/// are checked first so a non-standard deployment can still override.
+async fn panel_db_password() -> Option<String> {
+    fn password_from_url(url: &str) -> Option<String> {
+        let creds = url.split("://").nth(1)?.split('@').next()?;
+        let pw = creds.split(':').nth(1)?;
+        (!pw.is_empty()).then(|| pw.to_string())
+    }
+
+    if let Ok(pw) = std::env::var("PANEL_DB_PASSWORD") {
+        if !pw.is_empty() {
+            return Some(pw);
+        }
+    }
+    if let Some(pw) = std::env::var("DATABASE_URL").ok().as_deref().and_then(password_from_url) {
+        return Some(pw);
+    }
+
+    let env_file = tokio::fs::read_to_string("/etc/dockpanel/api.env").await.ok()?;
+    env_file
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("DATABASE_URL="))
+        .map(|v| v.trim_matches(['"', '\''].as_ref()))
+        .and_then(password_from_url)
+}
+
+/// Whether pdns settled into `active`.
+///
+/// A failing pdns is restarted by systemd, so a single probe can catch it
+/// mid-`activating` and read as healthy. Poll until it is unambiguously up or
+/// the budget runs out.
+async fn pdns_is_active() -> bool {
+    for _ in 0..10 {
+        let state = safe_command("systemctl").args(["is-active", "pdns"]).output().await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if state == "active" {
+            return true;
+        }
+        if state == "failed" || state == "inactive" {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    false
+}
+
+/// The most useful line from pdns's journal, for the operator-facing error.
+async fn pdns_failure_detail() -> String {
+    let journal = safe_command("journalctl")
+        .args(["-u", "pdns", "--no-pager", "-n", "40", "-o", "cat"])
+        .output().await
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+
+    journal
+        .lines()
+        .rev()
+        .find(|l| l.contains("Fatal error") || l.contains("Unable to bind") || l.contains("error"))
+        .map(|l| l.trim().chars().take(300).collect::<String>())
+        .unwrap_or_else(|| "check `journalctl -u pdns` for details".to_string())
+}
+
+/// Write `/etc/powerdns/pdns.conf` through the unsandboxed escape hatch.
+///
+/// `/etc/powerdns` is in the agent unit's `ReadWritePaths`, and systemd creates
+/// it at unit start — but `apt-get purge pdns-server` (see the uninstaller)
+/// deletes the directory, which detaches that bind mount for the remaining life
+/// of the agent process. A direct `tokio::fs::write` then fails EROFS on every
+/// reinstall until the agent restarts. Staging through `/var/lib/dockpanel` (a
+/// live ReadWritePaths entry) and moving the file into place with `install`
+/// sidesteps the detached mount entirely — and keeps the embedded API key off
+/// both the process argv and a world-readable config.
+async fn write_pdns_conf(contents: &str) -> Result<(), ApiErr> {
+    const STAGED: &str = "/var/lib/dockpanel/pdns.conf.staged";
+
+    // The staged copy carries the generated API key (and, on the pgsql path, the
+    // database password), so create it 0600 rather than letting the umask decide
+    // — and remove it on every exit path, not just the happy one.
+    let staged_result = stage_and_install_pdns_conf(STAGED, contents).await;
+    let _ = tokio::fs::remove_file(STAGED).await;
+    staged_result
+}
+
+async fn stage_and_install_pdns_conf(staged: &str, contents: &str) -> Result<(), ApiErr> {
+    // `mode` comes from tokio's own OpenOptions on unix — no std trait import needed.
+    let mut f = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(staged)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to stage pdns.conf: {e}")))?;
+    {
+        use tokio::io::AsyncWriteExt;
+        f.write_all(contents.as_bytes()).await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to stage pdns.conf: {e}")))?;
+        f.flush().await.ok();
+    }
+
+    let placed = tokio::time::timeout(
+        Duration::from_secs(60),
+        safe_command_unsandboxed("sh", &[])
+            .args(["-c", &format!(
+                "mkdir -p /etc/powerdns && install -o root -g pdns -m 640 {staged} /etc/powerdns/pdns.conf"
+            )])
+            .output(),
+    ).await
+        .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "Writing pdns.conf timed out"))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write pdns.conf: {e}")))?;
+
+    if !placed.status.success() {
+        let stderr = String::from_utf8_lossy(&placed.stderr);
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!(
+            "Failed to write pdns.conf: {}", stderr.trim().chars().take(300).collect::<String>()
+        )));
+    }
+    Ok(())
+}
+
 async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Value>, ApiErr> {
     // Optional JSON body {"backend": "sqlite" | "pgsql"}. Absent/empty/invalid → pgsql
     // (back-compat: older panels POST no body). SQLite removes the dependency on the
@@ -394,7 +557,7 @@ async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Va
     }
 
     // 4. Build the backend-specific config
-    let pdns_conf = if use_sqlite {
+    let mut pdns_conf = if use_sqlite {
         format!(r#"# DockPanel PowerDNS configuration (SQLite backend)
 launch=gsqlite3
 gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
@@ -411,22 +574,19 @@ webserver-allow-from=127.0.0.1
 default-soa-content=ns1.@ hostmaster.@ 0 10800 3600 604800 3600
 "#)
     } else {
-        // Use the same DB password as the panel's postgres connection (never hardcode)
-        let pdns_db_password = std::env::var("PANEL_DB_PASSWORD")
-            .or_else(|_| {
-                // Fall back: extract password from DATABASE_URL if set
-                std::env::var("DATABASE_URL").map(|url| {
-                    url.split("://").nth(1).unwrap_or("")
-                        .split('@').next().unwrap_or("")
-                        .split(':').nth(1).unwrap_or("").to_string()
-                })
-            })
-            .unwrap_or_else(|_| {
-                // Last resort: generate a random password
-                use rand::Rng;
-                let mut rng = rand::rng();
-                (0..32).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
-            });
+        // Use the same DB password as the panel's postgres connection (never
+        // hardcode). The agent unit carries no EnvironmentFile — it is started
+        // with `Environment=RUST_LOG=info` and nothing else — so PANEL_DB_PASSWORD
+        // and DATABASE_URL are never set here and the old env-var lookup always
+        // fell through to a freshly generated random password. That password
+        // matches no role, so pdns failed authentication on every start and the
+        // pgsql backend could not have worked on any install. Read the real
+        // credential from the API's env file instead.
+        let pdns_db_password = panel_db_password().await.ok_or_else(|| err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not read the panel database password from /etc/dockpanel/api.env — \
+             install PowerDNS with the SQLite backend instead, or repair DATABASE_URL",
+        ))?;
 
         format!(r#"# DockPanel PowerDNS configuration
 launch=gpgsql
@@ -449,13 +609,32 @@ default-soa-content=ns1.@ hostmaster.@ 0 10800 3600 604800 3600
 "#)
     };
 
-    // 5. Write PowerDNS config (/etc/powerdns is in the agent's ReadWritePaths)
-    tokio::fs::write("/etc/powerdns/pdns.conf", &pdns_conf).await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write pdns.conf: {e}")))?;
+    // 5. Pin the listening addresses when something already owns port 53
+    if let Some(addrs) = pdns_local_addresses().await {
+        tracing::info!("Port 53 already in use — binding PowerDNS to {addrs}");
+        pdns_conf.push_str(&format!(
+            "\n# Port 53 was already claimed at install time (systemd-resolved stub\n\
+             # listener on 127.0.0.53/127.0.0.54 on Ubuntu), so bind explicitly.\n\
+             local-address={addrs}\n"
+        ));
+    }
 
-    // 6. Enable and start
+    // 6. Write PowerDNS config
+    write_pdns_conf(&pdns_conf).await?;
+
+    // 7. Enable and start. `enable` stays best-effort, but a pdns that never
+    //    comes up must not be reported as a successful install — that silence
+    //    is what let the port-53 conflict ship unnoticed.
+    let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["reset-failed", "pdns"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["enable", "pdns"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["restart", "pdns"]).output()).await;
+
+    if !pdns_is_active().await {
+        let detail = pdns_failure_detail().await;
+        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!(
+            "PowerDNS was installed and configured ({backend_name} backend) but the service failed to start: {detail}"
+        )));
+    }
 
     tracing::info!("PowerDNS installed with API key (backend={backend_name})");
 

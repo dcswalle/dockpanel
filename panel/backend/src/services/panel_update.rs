@@ -47,6 +47,13 @@ const UPDATE_SCRIPT: &str = "/opt/dockpanel/scripts/update.sh";
 /// A snapshot row is considered "in flight" if it has `to_version IS NULL`
 /// and was created within this window. Older rows that never finalized are
 /// dead and don't block new applies.
+///
+/// Manual snapshots are excluded everywhere this predicate is used: they are
+/// taken on demand and legitimately keep `to_version` NULL forever (see the
+/// `panel_snapshots` migration), so treating them as unfinalized updates made
+/// a safety snapshot look like an update in progress — and let the
+/// abandoned-sweep below stamp them `to_version = 'abandoned'`, which
+/// `current_state` then reported as a successful update to "abandoned".
 const IN_FLIGHT_WINDOW_MIN: i64 = 15;
 
 /// Maximum length of the captured `update.sh` stdout tail kept in memory
@@ -189,10 +196,12 @@ pub async fn current_state(handle: &UpdateStateHandle, pool: &PgPool) -> UpdateS
     }
 
     // In-memory state says idle. Check DB for an unfinalized in-flight row.
+    // Manual snapshots never carry a `to_version`, so they must be excluded or
+    // taking a safety snapshot would masquerade as an update in progress.
     let cutoff = Utc::now() - chrono::Duration::minutes(IN_FLIGHT_WINDOW_MIN);
     if let Ok(Some(snap)) = sqlx::query_as::<_, PanelSnapshot>(
         "SELECT * FROM panel_snapshots \
-         WHERE to_version IS NULL AND created_at > $1 \
+         WHERE to_version IS NULL AND trigger <> 'manual' AND created_at > $1 \
          ORDER BY created_at DESC LIMIT 1",
     )
     .bind(cutoff)
@@ -274,9 +283,11 @@ pub async fn start_panel_update(
         }
     }
     let cutoff = Utc::now() - chrono::Duration::minutes(IN_FLIGHT_WINDOW_MIN);
+    // Same exclusion as `current_state`: a manual snapshot is not an update, so
+    // it must not lock out the one thing an operator does right after taking it.
     let in_flight_count: (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM panel_snapshots \
-         WHERE to_version IS NULL AND created_at > $1",
+         WHERE to_version IS NULL AND trigger <> 'manual' AND created_at > $1",
     )
     .bind(cutoff)
     .fetch_one(&pool)
@@ -505,7 +516,7 @@ pub async fn finalize_pending_on_startup(pool: &PgPool) {
     let cutoff = Utc::now() - chrono::Duration::minutes(IN_FLIGHT_WINDOW_MIN);
     let pending: Result<Vec<PanelSnapshot>, _> = sqlx::query_as(
         "SELECT * FROM panel_snapshots \
-         WHERE to_version IS NULL AND created_at > $1 \
+         WHERE to_version IS NULL AND trigger <> 'manual' AND created_at > $1 \
          ORDER BY created_at ASC",
     )
     .bind(cutoff)
@@ -552,10 +563,13 @@ pub async fn finalize_pending_on_startup(pool: &PgPool) {
     }
 
     // Mark older, abandoned in-flight rows with a sentinel so they don't
-    // perpetually block /api/update/apply.
+    // perpetually block /api/update/apply. Manual snapshots are exempt — they
+    // are never in flight, and stamping one 'abandoned' made it the newest
+    // finalized row, which `current_state` reads as a completed update from the
+    // running version to a version literally called "abandoned".
     if let Err(e) = sqlx::query(
         "UPDATE panel_snapshots SET to_version = 'abandoned' \
-         WHERE to_version IS NULL AND created_at <= $1",
+         WHERE to_version IS NULL AND trigger <> 'manual' AND created_at <= $1",
     )
     .bind(cutoff)
     .execute(pool)
