@@ -169,6 +169,16 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     # apply (which could shift to a newer GA between poll and click).
     if [ -n "${DOCKPANEL_VERSION:-}" ]; then
         RELEASE_TAG="$DOCKPANEL_VERSION"
+        # Accept a bare semver too. Panels up to v2.11.2 passed the version with
+        # the `v` already stripped (their poller normalises it for display), which
+        # built releases/download/2.11.2/... — a 404 — so their self-update could
+        # never complete. Those panels ship a fixed binary only by updating, so
+        # the only thing that can heal them is this script: the repo sync above
+        # pulls this file before the download runs, meaning a second attempt on
+        # an old panel now succeeds.
+        case "$RELEASE_TAG" in
+            [0-9]*) RELEASE_TAG="v$RELEASE_TAG" ;;
+        esac
         log "Pinned release: $RELEASE_TAG (DOCKPANEL_VERSION)"
     else
         log "Fetching latest release..."
