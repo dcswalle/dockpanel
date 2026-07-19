@@ -6,6 +6,100 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.1] - 2026-07-19
+
+Dependency-security release. No feature changes and no application source
+changes — the diff is lockfiles, dependency floors, and one Dockerfile
+line. Clears all 33 Dependabot advisories on the default branch (10 high,
+13 moderate, 10 low) plus three RustSec advisories that Dependabot never
+surfaced.
+
+### Security
+
+- **Cleared all 33 Dependabot advisories.** Every one resolved within the
+  already-declared semver range, so no application code had to change:
+  `react-router`/`react-router-dom` 7.13.1 → 7.18.1 (14 advisories,
+  8 of them high — CVE-2026-33245, CVE-2026-42211, CVE-2026-42342,
+  CVE-2026-34077, CVE-2026-33244, CVE-2026-40181, CVE-2026-53663),
+  `dompurify` 3.4.2 → 3.4.12 (8), `vite` 6.4.2 → 6.4.3 (4, incl.
+  CVE-2026-53571 high), `@babel/core` 7.29.0 → 7.29.7 (2), `rand`
+  0.8.5 → 0.8.6 (2, RUSTSEC-2026-0097), `qs` 6.15.0 → 6.15.3 (1,
+  CVE-2026-8723), `esbuild` 0.27.4 → 0.28.1 (1), `serde_with`
+  3.18.0 → 3.21.0 (1, GHSA-7gcf-g7xr-8hxj). `npm audit` now reports
+  zero vulnerabilities across all three package manifests.
+- **Fixed three RustSec advisories that Dependabot did not report.**
+  `cargo audit` catches Rust advisories that Dependabot's Cargo.lock
+  scanning missed entirely, which is why it is worth running both:
+  `lettre` 0.11.21 → 0.11.22 (RUSTSEC-2026-0141, CVSS 9.1 — TLS
+  hostname verification disabled on the Boring backend), `quinn-proto`
+  0.11.14 → 0.11.15 (RUSTSEC-2026-0185, CVSS 7.5 — remote memory
+  exhaustion via unbounded out-of-order stream reassembly), and
+  `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204 — invalid
+  pointer dereference in the `fmt::Pointer` impl). `anyhow`
+  1.0.102 → 1.0.104 also clears RUSTSEC-2026-0190 (unsoundness in
+  `Error::downcast_mut()`), which had been sitting as an accepted
+  warning. `cargo audit` now reports zero vulnerabilities for all three
+  crates; the only remaining entries are two informational warnings with
+  no upstream fix (`rustls-pemfile` unmaintained, `spin` yanked).
+  Of these, only `crossbeam-epoch` is actually compiled into a shipped
+  binary — see the notes below.
+- **Dependency floors now live in the manifests, not only the
+  lockfiles.** `panel/frontend/package.json` still declared
+  `react-router-dom: ^7.5.0`, `dompurify: ^3.2.0` and `vite: ^6.4.2`,
+  and `website/client/package.json` declared `react-router-dom:
+  ^7.13.1` — all of which legally permit the *vulnerable* versions.
+  Only `package-lock.json` was holding the patched resolution, so any
+  lockfile-less install could resolve straight back below the fix. The
+  declared ranges are now `^7.18.1`, `^3.4.12` and `^6.4.3`.
+- **`panel/frontend/Dockerfile` now uses `npm ci` instead of
+  `npm install`**, matching `website/client/Dockerfile` and
+  `website/server/Dockerfile`, which already did. With `npm install` a
+  Docker build was free to re-resolve past the audited versions and
+  silently rewrite the lockfile, so the image was not provably the
+  build that was reviewed.
+
+### Notes
+
+Four of the patched advisories were **never exploitable in DockPanel's
+configuration**. They are fixed anyway — depending on a vulnerable
+version is worth avoiding on its own — but the honest framing is that no
+DockPanel install was at risk from them:
+
+- **RUSTSEC-2026-0141 (`lettre`, CVSS 9.1)** — the inverted
+  hostname-verification flag lives entirely inside the crate's
+  `boring-tls` feature arms. DockPanel builds `lettre` with
+  `default-features = false` and `tokio1-rustls-tls`; `boring` is absent
+  from the dependency graph and the rustls arm is byte-identical between
+  0.11.21 and 0.11.22. The vulnerable line was never compiled.
+- **RUSTSEC-2026-0185 (`quinn-proto`)** — a lockfile-only entry. `http3`
+  is not enabled on either binary, so `quinn-proto` never enters the
+  normal build graph.
+- **GHSA-7gcf-g7xr-8hxj (`serde_with`)** — the panicking `KeyValueMap`
+  serializer is never instantiated anywhere in the tree.
+- **RUSTSEC-2026-0190 (`anyhow`)** — an orphaned lockfile entry with no
+  reverse-dependency edge in either crate (`cargo tree -i anyhow` prints
+  nothing even with `--target all -e all`). Bumping it was a verified
+  no-op: `cargo build --release` finished in 0.31s, i.e. cargo had
+  nothing to recompile, which is itself proof the crate is not linked
+  into either binary.
+- **The four DOMPurify advisory classes** (hook pollution, `setConfig`
+  `ALLOWED_ATTR` pollution, `SAFE_FOR_TEMPLATES` bypass, `IN_PLACE`
+  closure leak) each require API surface with zero call sites. The panel
+  has exactly one DOMPurify entry point — a bare
+  `DOMPurify.sanitize(string)` with no config, in the markdown runbook
+  renderer.
+
+Two upstream behavior changes do ship and are worth knowing about:
+
+- **`lettre`** now caps SMTP replies at 1000 bytes per line and 100 KB
+  total. RFC 5321 limits reply lines to 512 bytes, so a conformant relay
+  cannot trip this — but a non-conformant relay that previously worked
+  may now fail with `SMTP response line too long`.
+- **DOMPurify** now always strips `patchsrc`, and strips `for` on any
+  element other than `<label>`/`<output>`. This only affects raw HTML
+  hand-written into a custom runbook; none of the 15 shipped runbooks
+  are affected.
+
 ## [2.11.0] - 2026-07-19
 
 Three community-requested enhancements
