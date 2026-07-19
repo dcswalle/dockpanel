@@ -228,6 +228,16 @@ export default function Telemetry() {
 
   useEffect(() => { loadEvents(); }, [page, categoryFilter, typeFilter]);
 
+  // A fleet run takes minutes and the table was only ever loaded on mount, so a
+  // run sat at "running..." until the operator reloaded the page by hand. Poll
+  // while at least one run has no outcome yet, and stop as soon as none do.
+  const hasRunningFleet = fleetRuns.some(r => !r.outcome);
+  useEffect(() => {
+    if (!hasRunningFleet) return;
+    const t = setInterval(() => { loadFleetRuns(); }, 10000);
+    return () => clearInterval(t);
+  }, [hasRunningFleet]);
+
   // Phase 4 W4: poll /update/status while applying so the modal reflects
   // live progress. Stops when the state transitions out of in_flight.
   useEffect(() => {
@@ -956,7 +966,37 @@ export default function Telemetry() {
                           {Array.isArray(r.progress)
                             ? `${r.progress.filter(p => p.status === "succeeded").length}/${r.progress.length} succeeded`
                             : "—"}
+                          {r.include_panel ? " · panel last" : ""}
                         </div>
+                        {/* The reason a member failed was recorded but never
+                            rendered, so a fleet run that stopped on an
+                            actionable error ("update script not found at ...")
+                            showed only "0/1 succeeded". */}
+                        {Array.isArray(r.progress) &&
+                          r.progress
+                            .filter(p => p.error)
+                            .map(p => {
+                              const name =
+                                (Array.isArray(r.plan)
+                                  ? r.plan.find(pl => pl.server_id === p.server_id)?.name
+                                  : null) || p.server_id.slice(0, 8);
+                              return (
+                                <div
+                                  key={p.server_id}
+                                  className="mt-1 text-danger-400 break-words"
+                                  title={p.error || ""}
+                                >
+                                  {name}: {p.error}
+                                </div>
+                              );
+                            })}
+                        {Array.isArray(r.progress) &&
+                          r.progress.some(p => p.status === "skipped") && (
+                            <div className="mt-1 text-amber-400">
+                              {r.progress.filter(p => p.status === "skipped").length} server(s)
+                              skipped — the run halted on the first failure
+                            </div>
+                          )}
                       </div>
                     );
                   })}

@@ -6,6 +6,98 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.8] - 2026-07-19
+
+### Fixed
+
+- **The fleet rolling update could not update a single one of the servers it
+  was built for, and once that was unblocked it reported success on a box that
+  never moved.** Both halves were found by running the path against a real
+  remote agent for the first time, on a two-machine lab.
+
+  - `scripts/install-agent.sh` — the only documented way to add a remote server
+    — never creates `/opt/dockpanel`. The agent's update receiver required
+    `/opt/dockpanel/scripts/update.sh` and refused with
+    `500: update script not found` in 166 ms, so the feature's success rate on
+    its entire target population was zero. It failed safely, at least: nothing
+    on the remote box was touched.
+  - Planting that repo, which is the obvious fix, was probed rather than
+    shipped — and it turned the loud failure into a silent one. `update.sh` is
+    the *panel* updater: it syncs a git repo, dumps a postgres container, and
+    replaces the API, the frontend and the nginx config, none of which exist on
+    an agent-only box. It aborted at `No such container: dockpanel-postgres`
+    **one second after the panel had already recorded the server as
+    succeeded**, and the agent stayed on its old version.
+  - The false success came from status being read off the wrong process.
+    `update.sh` re-execs itself into a PID1-owned transient unit with
+    `exec systemd-run` (no `--wait`), so the child the agent waits on exits 0
+    the moment systemd *accepts* the job — measured at 124 ms. The agent
+    promoted that into `Succeeded`, and the orchestrator took the agent's word
+    for it.
+
+  What changed: a remote agent now updates *itself* — one binary, fetched for
+  the requested release tag, **verified against that release's `checksums.txt`
+  before it is installed**, swapped in by rename (never a copy onto a running
+  executable), then restarted, with the result written to
+  `/var/lib/dockpanel/last-agent-update.json` on every exit path. If the new
+  binary does not come up reporting the target version, the previous one is
+  restored. Full panel installs keep using `update.sh` as before. The procedure
+  is compiled into the agent, so it does not depend on any file being present
+  on the remote box.
+
+  And the orchestrator now decides from ground truth: it waits until the agent's
+  `/health` reports the target version, which is what the W4 design specified in
+  the first place. A self-reported success is no longer accepted as evidence;
+  a self-reported *failure* still is, because that one an agent can state
+  honestly.
+
+- **A failed fleet update left the remote box permanently un-updatable.** An
+  updater that fails without restarting the agent never cleared the in-flight
+  flag, so every later attempt — including the one correcting the operator's
+  typo — was refused `409 an update is already in flight` until someone
+  restarted the agent by hand. The guard now asks whether the run actually
+  finished rather than trusting a flag nothing clears.
+
+- **A fleet failure took ten minutes to surface a reason that was known in one
+  second.** With the update stopped before the restart, the agent's in-memory
+  state stayed `in_flight`, so the panel waited out its whole deadline and
+  reported a generic timeout. Failures now resolve in ~10 s with the real
+  cause (e.g. `could not download …/v2.99.0/dockpanel-agent-linux-amd64`).
+
+- **The rolling update rolled the fleet in the wrong order.** `agent_version`
+  is a text column, so ordering by it in SQL sorted `2.9.0` *after* `2.10.0` —
+  the "oldest first" plan started with the newest box. Ordering is now done on
+  parsed version components.
+
+- **The "also update this panel" checkbox did nothing.** `include_panel` was
+  written to the run record and read by no one since v2.10.0. It now starts the
+  panel's own update after the fleet finishes, and only if every member
+  succeeded — updating the panel on top of a half-rolled fleet is the ordering
+  the design explicitly rules out.
+
+- **A panel installed without a domain handed the operator an add-server
+  command that could not run.** `BASE_URL` is empty on IP-only installs, which
+  produced `curl -sSL /install-agent.sh … --panel-url  --token <token>`; the
+  installer's argument parser then consumed `--token` as the value of
+  `--panel-url` and died on the token itself. Worse, an agent installed without
+  a panel URL never checks in, and a server that never checks in can never be
+  selected by a fleet update. The panel now emits a clearly-marked placeholder
+  instead of an empty flag, and `install-agent.sh` refuses to install without
+  `--panel-url` and `--server-id` rather than producing a box that is silently
+  invisible to the fleet.
+
+- `install-agent.sh` no longer discards the result of starting the agent. It
+  waits for the unit to become active and prints the failing journal lines
+  instead of a success banner, the same failure surface added to the PowerDNS
+  installer in 2.11.2.
+
+### Notes
+
+- Upgrading an existing fleet: the fix lives in the agent, so a member still on
+  2.11.7 or older cannot be rolled from the panel — it will report that it is
+  too old, and naming the remedy. Re-run `install-agent.sh` on those boxes once
+  to reach 2.11.8; fleet updates work from then on.
+
 ## [2.11.7] - 2026-07-19
 
 ### Fixed

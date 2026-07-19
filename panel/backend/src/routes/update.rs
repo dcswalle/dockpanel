@@ -359,8 +359,14 @@ pub async fn apply_fleet(
     let agents = state.agents.clone();
     let target = body.target_version.clone();
     let halt = body.halt_on_failure;
+    // Passing the handle is what makes the operator's "include this panel"
+    // checkbox do anything — it was persisted and read by nobody until s232.
+    let panel_handle = body
+        .include_panel
+        .then(|| state.panel_update_state.clone());
     tokio::spawn(async move {
-        panel_update::execute_fleet_plan(pool, agents, run_id, plan, target, halt).await;
+        panel_update::execute_fleet_plan(pool, agents, run_id, plan, target, halt, panel_handle)
+            .await;
     });
 
     Ok((

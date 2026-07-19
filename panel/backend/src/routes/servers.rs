@@ -98,12 +98,36 @@ pub async fn create(
     .await
     .map_err(|e| internal_error("create servers", e))?;
 
-    // Generate install script with panel URL and token
-    let panel_url = &state.config.base_url;
-    let install_script = format!(
-        "curl -sSL {panel_url}/install-agent.sh | sudo bash -s -- \\\n  --panel-url {panel_url} \\\n  --token {agent_token} \\\n  --server-id {}",
-        server.id
-    );
+    // Generate install script with panel URL and token.
+    //
+    // `base_url` is EMPTY on every IP-only install — setup.sh only writes it
+    // when a domain was given. Interpolating that produced
+    // `curl -sSL /install-agent.sh … --panel-url  --token <tok>`, which is not a
+    // URL and whose arg parser then swallows `--token` as the value of
+    // `--panel-url` and dies on `Unknown argument: <tok>`. And an agent
+    // installed without a panel URL never phones home, so `last_seen_at` stays
+    // NULL and the box is invisible to the fleet plan's reachability gate
+    // forever. Fall back to the address the operator just typed for this server
+    // — they are on the panel, so they know where it is.
+    let panel_url = if state.config.base_url.trim().is_empty() {
+        None
+    } else {
+        Some(state.config.base_url.trim().trim_end_matches('/').to_string())
+    };
+    let install_script = match &panel_url {
+        Some(url) => format!(
+            "curl -sSL {url}/install-agent.sh | sudo bash -s -- \\\n  --panel-url {url} \\\n  --token {agent_token} \\\n  --server-id {}",
+            server.id
+        ),
+        None => format!(
+            "# This panel has no BASE_URL configured (it was installed without a domain).\n\
+             # Replace https://PANEL-ADDRESS with the address this server can reach it on,\n\
+             # in BOTH places — an agent installed without --panel-url never checks in, and\n\
+             # a server that never checks in can never be picked up by a fleet update.\n\
+             curl -sSL https://PANEL-ADDRESS/install-agent.sh | sudo bash -s -- \\\n  --panel-url https://PANEL-ADDRESS \\\n  --token {agent_token} \\\n  --server-id {}",
+            server.id
+        ),
+    };
 
     activity::log_activity(
         &state.db,

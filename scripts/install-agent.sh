@@ -32,6 +32,25 @@ if [[ -z "$TOKEN" ]]; then
     exit 1
 fi
 
+# An agent with no central URL never phones home, so the panel never records a
+# `last_seen_at` for it — and the fleet rolling update only considers servers
+# seen in the last 5 minutes. The box would install fine and then be invisible
+# to every fleet operation, with nothing anywhere saying why. Fail loudly here
+# instead. (The panel used to hand out a copy-paste command with an empty
+# --panel-url whenever it was installed without a domain; that is fixed too.)
+if [[ -z "$PANEL_URL" || -z "$SERVER_ID" ]]; then
+    echo "Error: --panel-url and --server-id are required"
+    echo "  Without them the agent cannot check in, and a server that never"
+    echo "  checks in can never be selected by a fleet update."
+    echo "Usage: $0 --panel-url <url> --token <token> --server-id <uuid>"
+    exit 1
+fi
+if [[ "$PANEL_URL" == --* || "$TOKEN" == --* || "$SERVER_ID" == --* ]]; then
+    echo "Error: an option value looks like another flag (--panel-url '$PANEL_URL',"
+    echo "  --server-id '$SERVER_ID'). One of the values is probably missing."
+    exit 1
+fi
+
 echo "======================================"
 echo "  DockPanel Agent Installer (Remote)"
 echo "======================================"
@@ -178,10 +197,31 @@ elif command -v firewall-cmd &> /dev/null; then
     firewall-cmd --reload > /dev/null 2>&1 || true
 fi
 
-# Start agent
+# Start agent. "The command ran" is not the success condition — "the unit is
+# active" is. install_powerdns ended in `let _ = systemctl restart` and hid three
+# separate bugs behind that silence for two releases (lesson #45), so this
+# installer polls and shows the failing journal line rather than printing a
+# success banner over a crash loop. `activating` is tolerated because a unit
+# with Restart=always can be caught mid-cycle by a single probe.
 systemctl daemon-reload
-systemctl enable dockpanel-agent
-systemctl start dockpanel-agent
+systemctl enable dockpanel-agent >/dev/null 2>&1 || true
+systemctl start dockpanel-agent || true
+
+AGENT_OK=0
+for _ in $(seq 1 15); do
+    STATE=$(systemctl is-active dockpanel-agent 2>/dev/null || true)
+    if [[ "$STATE" == "active" ]]; then AGENT_OK=1; break; fi
+    [[ "$STATE" == "failed" ]] && break
+    sleep 1
+done
+
+if [[ "$AGENT_OK" != "1" ]]; then
+    echo ""
+    echo "Error: dockpanel-agent did not start (systemctl is-active: $(systemctl is-active dockpanel-agent 2>/dev/null || echo unknown))"
+    echo "Last journal lines:"
+    journalctl -u dockpanel-agent -n 15 --no-pager 2>/dev/null || true
+    exit 1
+fi
 
 echo ""
 echo "======================================"

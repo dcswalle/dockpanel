@@ -840,11 +840,41 @@ version re-ran the migration against objects that already existed, leaving the
 panel in a startup crash loop. Rolling back with v2.11.7 or newer replaces the
 schema outright and is unaffected.
 
+#### What a fleet rolling update actually does
+
+`POST /api/update/fleet` builds an ordered plan of your remote servers — oldest
+agent version first, skipping any that are already at the target and any that
+have not checked in for five minutes — and returns `202` with a `run_id`. Poll
+`GET /api/update/fleet/{id}` for per-server progress; each entry carries the
+outcome and, on failure, the reason.
+
+Each member updates **its own agent binary**: the agent fetches
+`dockpanel-agent-linux-<arch>` for the requested release tag, verifies it
+against that release's `checksums.txt` *before* installing it, swaps it in by
+rename, restarts itself, and rolls back to the previous binary if the new one
+does not come up. The result is written to
+`/var/lib/dockpanel/last-agent-update.json` on the member. A server that is
+itself a full DockPanel install runs the ordinary `update.sh` flow instead.
+
+A member counts as updated only when its `/health` reports the target version.
+Nothing infers success from an exit status or from the agent's own claim — up to
+v2.11.7 it did, and a fleet run could report success on a box whose update had
+aborted a second earlier.
+
+With `halt_on_failure` (the default) the run stops at the first failure and the
+remaining members are marked `skipped`. `include_panel` updates the panel itself
+after the fleet, and only if every member succeeded.
+
+**Upgrading a fleet that is on 2.11.7 or older:** the mechanism lives in the
+agent, so those members cannot be rolled from the panel. They report that they
+are too old and name the remedy — re-run `install-agent.sh` on them once to
+reach 2.11.8, after which fleet updates work normally.
+
 Agent-side (called by the orchestrator over the agent's bearer-auth API):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| POST   | `/panel/update` | Kick off update.sh on the agent host. `{target_version}` |
-| GET    | `/panel/update/status` | Best-effort agent-local state during apply |
+| POST   | `/panel/update` | Start the update on the agent host. `{target_version}`. Returns immediately |
+| GET    | `/panel/update/status` | Progress window + failure reason. Reports `running_version`; success is confirmed from `/health`, not from here |
 
 Note: distinct from `/system/updates/*` (OS-package apt-get mgmt).

@@ -614,18 +614,22 @@ pub async fn build_fleet_plan(
     target_version: &str,
 ) -> Result<Vec<FleetPlanRow>, sqlx::Error> {
     let target_clean = target_version.trim_start_matches('v').to_string();
+    // NOT ordered in SQL: `agent_version` is text, so postgres would sort it
+    // lexicographically and put 2.9.0 AFTER 2.10.0 — i.e. it would roll the
+    // newest box first and call it the oldest. Ordering happens below, on
+    // parsed numeric components.
     let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
         "SELECT id, name, agent_version FROM servers \
          WHERE user_id = $1 \
            AND last_seen_at > NOW() - INTERVAL '5 minutes' \
            AND is_local = false \
-         ORDER BY agent_version ASC NULLS FIRST, last_seen_at DESC",
+         ORDER BY last_seen_at DESC",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
+    let mut plan: Vec<FleetPlanRow> = rows
         .into_iter()
         .filter(|(_, _, v)| {
             v.as_deref()
@@ -637,7 +641,31 @@ pub async fn build_fleet_plan(
             name,
             agent_version,
         })
-        .collect())
+        .collect();
+
+    // Oldest first, unknown version first (a box that has never reported one is
+    // the most suspect). `last_seen_at DESC` from the query is preserved within
+    // a version by the stable sort.
+    plan.sort_by_key(|r| semver_key(r.agent_version.as_deref()));
+    Ok(plan)
+}
+
+/// Sortable numeric key for a `X.Y.Z` (optionally `v`-prefixed) version.
+/// `None` sorts first. Anything unparseable sorts with whatever it parsed,
+/// which keeps a malformed row from jumping to the end of the queue.
+fn semver_key(v: Option<&str>) -> (u8, u64, u64, u64) {
+    let Some(v) = v else {
+        return (0, 0, 0, 0);
+    };
+    let core = v.trim_start_matches('v');
+    let core = core.split('-').next().unwrap_or(core);
+    let mut it = core.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        1,
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
 }
 
 /// Create a new fleet_update_runs row and return its id. The caller
@@ -683,6 +711,7 @@ pub async fn create_fleet_run(
 /// Walk the plan, POST `/panel/update` to each agent, poll status until
 /// terminal, record per-server progress. Writes terminal `outcome` field
 /// on completion. Long-running — spawn as a tokio task.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_fleet_plan(
     pool: PgPool,
     agents: crate::services::agent::AgentRegistry,
@@ -690,6 +719,7 @@ pub async fn execute_fleet_plan(
     plan: Vec<FleetPlanRow>,
     target_version: String,
     halt_on_failure: bool,
+    include_panel: Option<UpdateStateHandle>,
 ) {
     let mut progress: Vec<FleetProgressRow> = plan
         .iter()
@@ -750,6 +780,29 @@ pub async fn execute_fleet_plan(
     .await;
 
     tracing::info!("Fleet update run {run_id} completed with outcome {outcome}");
+
+    // `include_panel` (design memo §3.D5: fleet rolls first, the panel itself
+    // last) was stored on the run row and read by nothing — the operator's
+    // checkbox has been inert since v2.10.0. Honour it now, and only when every
+    // member actually made it: updating the panel on top of a half-rolled fleet
+    // is the one ordering the design explicitly rules out.
+    if let Some(handle) = include_panel {
+        if any_failed {
+            tracing::warn!(
+                "Fleet run {run_id}: include_panel was requested but the fleet did not \
+                 fully succeed ({outcome}) — leaving the panel on its current version"
+            );
+            return;
+        }
+        match start_panel_update(handle, pool.clone(), target_version.clone(), None).await {
+            Ok(_) => tracing::info!(
+                "Fleet run {run_id}: fleet complete, panel self-update to {target_version} started"
+            ),
+            Err(e) => tracing::error!(
+                "Fleet run {run_id}: fleet complete but the panel self-update could not start: {e}"
+            ),
+        }
+    }
 }
 
 async fn persist_progress(
@@ -766,9 +819,18 @@ async fn persist_progress(
     Ok(())
 }
 
-/// POST `/panel/update` to a remote agent, then poll `/panel/update/status`
-/// up to ~10 minutes for terminal state. Returns Ok on succeeded, Err on
-/// failed/rolled_back/timeout.
+/// POST `/panel/update` to a remote agent, then wait for the agent to actually
+/// be RUNNING the target version. Returns Ok only on that observation.
+///
+/// It used to return Ok as soon as the agent's own `/panel/update/status` said
+/// `"succeeded"`. That state is process-local and was being set from the exit
+/// status of `systemd-run`, which returns 0 the instant PID1 accepts the job —
+/// so on the s232 two-box lab the panel recorded a fleet member as **succeeded
+/// in 5.1s** while that member never moved off 2.11.2 and its updater aborted a
+/// second later. A restart is a step, not an outcome (lesson #49); the only
+/// honest evidence that an update landed is the version the agent reports for
+/// itself afterwards, which is what the W4 design §4.5 specified in the first
+/// place ("Polls `/health` for the new version").
 async fn update_one_server(
     agents: &crate::services::agent::AgentRegistry,
     server_id: Uuid,
@@ -790,48 +852,69 @@ async fn update_one_server(
     // servers on OLDER builds whose on-disk update.sh predates that heal.
     let normalized = format!("v{}", target_version.trim_start_matches('v'));
     let payload = Some(serde_json::json!({ "target_version": normalized }));
-    handle
-        .post("/panel/update", payload)
-        .await
-        .map_err(|e| format!("POST /panel/update: {e}"))?;
+    if let Err(e) = handle.post("/panel/update", payload).await {
+        let raw = e.to_string();
+        // Agents before 2.11.8 could only run the PANEL updater, which is not
+        // present on an agent-only box — so they refuse with this exact message
+        // and there is nothing the panel can do about it remotely. Say what to
+        // do instead of handing the operator a path that does not exist.
+        if raw.contains("update script not found") {
+            return Err(format!(
+                "this agent is too old to be updated from the panel (it looks for the panel \
+                 updater, which agent-only boxes do not have). Re-run install-agent.sh on it \
+                 once to reach 2.11.8+, after which fleet updates work — original error: {raw}"
+            ));
+        }
+        return Err(format!("POST /panel/update: {raw}"));
+    }
 
-    // Poll status. Total budget ~10 min. The remote agent's update.sh has
-    // its own ~3-5 min wall-clock when downloading binaries.
+    // Total budget ~10 min: the remote agent downloads a ~21MB binary, restarts,
+    // and has to come back up.
+    let target_clean = target_version.trim_start_matches('v').to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    let mut last_seen_version = String::new();
+
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let resp = match handle.get("/panel/update/status").await {
-            Ok(v) => v,
-            Err(_) => continue, // agent may be mid-restart; transient
-        };
-        let state = resp
-            .get("state")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        match state.as_str() {
-            "succeeded" => return Ok(()),
-            "rolled_back" => {
+
+        // GROUND TRUTH first. `/health` is served by whichever binary is
+        // actually running, so it cannot report a version that is not installed.
+        // Connection errors are expected here — the agent restarts itself
+        // partway through — and are never treated as failure.
+        if let Ok(health) = handle.get("/health").await {
+            if let Some(v) = health.get("version").and_then(|v| v.as_str()) {
+                last_seen_version = v.to_string();
+                if v.trim_start_matches('v') == target_clean {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Then the agent's own report, which is only trusted when it says
+        // something went WRONG — a claim it can make honestly, unlike success.
+        // (After the restart this also surfaces the updater's on-disk verdict,
+        // which is the only record that survives the process that wrote it.)
+        if let Ok(resp) = handle.get("/panel/update/status").await {
+            let state = resp.get("state").and_then(|s| s.as_str()).unwrap_or("");
+            if state == "failed" || state == "rolled_back" {
                 return Err(format!(
-                    "agent rolled back: {}",
+                    "agent reported {state}: {}",
                     resp.get("reason")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unspecified")
                 ));
             }
-            "failed" => {
-                return Err(format!(
-                    "agent failed: {}",
-                    resp.get("reason")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unspecified")
-                ));
-            }
-            "in_flight" | "idle" => continue,
-            _ => continue, // unknown state, keep polling until deadline
         }
     }
-    Err("timed out waiting for remote agent to finalize update".into())
+
+    Err(format!(
+        "timed out after 10min — agent still reports version {}, wanted {target_clean}",
+        if last_seen_version.is_empty() {
+            "nothing".into()
+        } else {
+            last_seen_version
+        }
+    ))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -880,6 +963,65 @@ mod tests {
         assert_eq!(
             parse_target_from_trigger(&format!("fleet:{uuid}")),
             None
+        );
+    }
+
+    #[test]
+    fn fleet_plan_orders_by_semver_not_lexicographically() {
+        // The bug this replaces: postgres sorting `agent_version` as text puts
+        // "2.9.0" AFTER "2.10.0", so the rolling update starts with the NEWEST
+        // box while claiming to start with the oldest.
+        let mut vs = vec![
+            Some("2.10.0"),
+            Some("v2.9.0"),
+            None,
+            Some("2.11.7"),
+            Some("2.9.10"),
+        ];
+        vs.sort_by_key(|v| semver_key(*v));
+        assert_eq!(
+            vs,
+            vec![
+                None,
+                Some("v2.9.0"),
+                Some("2.9.10"),
+                Some("2.10.0"),
+                Some("2.11.7")
+            ]
+        );
+    }
+
+    #[test]
+    fn semver_key_tolerates_junk_without_reordering_the_queue() {
+        assert_eq!(semver_key(None), (0, 0, 0, 0));
+        assert_eq!(semver_key(Some("v2.11.7-rc.3")), (1, 2, 11, 7));
+        assert_eq!(semver_key(Some("garbage")), (1, 0, 0, 0));
+        assert_eq!(semver_key(Some("2.11")), (1, 2, 11, 0));
+    }
+
+    /// The fleet orchestrator must decide "updated" from what the agent is
+    /// RUNNING, not from what it says about itself — the agent's own state was
+    /// being set from the exit status of the process that merely launched the
+    /// update, and reported success 124ms in (lesson #49, measured s232).
+    #[test]
+    fn update_one_server_confirms_from_ground_truth() {
+        let src = include_str!("panel_update.rs");
+        let body = &src[src.find("async fn update_one_server").unwrap()..];
+        let body = &body[..body.find("// ── Tests").unwrap_or(body.len())];
+        assert!(
+            body.contains("handle.get(\"/health\")"),
+            "must read the version the agent is actually running"
+        );
+        let ok_at = body.find("return Ok(())").expect("no success path");
+        let health_at = body.find("handle.get(\"/health\")").unwrap();
+        assert!(
+            health_at < ok_at,
+            "the only success path must be downstream of the health probe"
+        );
+        // Negative control: the exact line that shipped.
+        assert!(
+            !body.contains("\"succeeded\" => return Ok(())"),
+            "a self-reported state string is not evidence an update landed"
         );
     }
 
