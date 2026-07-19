@@ -20,14 +20,33 @@ set -euo pipefail
 #
 # Re-exec into a transient scope so we live outside the unit being stopped.
 # Harmless for the normal SSH invocation — that cgroup never matches.
+# Must be a transient *service* (PID1-owned), not `--scope`: a scope is created
+# in the caller's context, so it lands in the invoking session's user-0.slice and
+# dies with it ("Removed slice user-0.slice" — observed killing an update
+# mid-swap). A transient service is owned by PID1 and outlives both the unit
+# being stopped and any session.
 if [ -z "${DOCKPANEL_UPDATE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&1; then
     if grep -qE 'dockpanel-(api|agent)\.service' /proc/self/cgroup 2>/dev/null; then
-        export DOCKPANEL_UPDATE_DETACHED=1
         echo "[+] Re-executing outside the panel's service cgroup..."
-        exec systemd-run --quiet --collect --scope --description="DockPanel self-update" \
+        exec systemd-run --quiet --collect \
+            --unit="dockpanel-self-update-$$" \
+            --setenv=DOCKPANEL_UPDATE_DETACHED=1 \
+            --setenv=INSTALL_FROM_RELEASE="${INSTALL_FROM_RELEASE:-}" \
+            --setenv=DOCKPANEL_VERSION="${DOCKPANEL_VERSION:-}" \
+            --setenv=DOCKPANEL_NO_SELF_REFRESH="${DOCKPANEL_NO_SELF_REFRESH:-}" \
             bash "$0" "$@"
     fi
 fi
+
+# Safety net: if we get killed or fail after the services are stopped but before
+# they are started again, bring them back rather than leaving the box dark.
+_dockpanel_services_stopped=0
+_dockpanel_restore() {
+    if [ "$_dockpanel_services_stopped" = "1" ]; then
+        systemctl start dockpanel-agent dockpanel-api 2>/dev/null || true
+    fi
+}
+trap _dockpanel_restore EXIT INT TERM
 
 # ── Colors ────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -520,6 +539,7 @@ cp "$API_BIN" "${API_BIN}.bak" 2>/dev/null || true
 cp "$CLI_BIN" "${CLI_BIN}.bak" 2>/dev/null || true
 
 log "Stopping services..."
+_dockpanel_services_stopped=1
 systemctl stop dockpanel-agent dockpanel-api 2>/dev/null || true
 
 if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
@@ -538,6 +558,7 @@ systemctl daemon-reload
 systemctl start dockpanel-agent
 sleep 1
 systemctl start dockpanel-api
+_dockpanel_services_stopped=0
 log "Services restarted"
 
 # ── Health check with rollback ────────────────────────────────────────────
