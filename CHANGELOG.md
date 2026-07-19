@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.6] - 2026-07-19
+
+### Added
+
+- **The rollback verdict is now visible in the panel**, not only on the API.
+  2.11.5 made a restore report its outcome truthfully to
+  `GET /api/update/status`; this surfaces it in Settings → Telemetry above the
+  snapshot list, in green when the last rollback completed and in red when it
+  failed — naming the stage it stopped at, and stating that a failure before the
+  database stage completes leaves the database exactly as it was. A rollback
+  stops and restarts the panel, so the operator has no other way to learn what
+  happened; shipping the field without the surface would have left them to read
+  a JSON endpoint by hand.
+
 ## [2.11.5] - 2026-07-19
 
 Snapshot restore works. It never had — every pre-update snapshot the panel has

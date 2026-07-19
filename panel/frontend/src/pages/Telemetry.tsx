@@ -62,6 +62,16 @@ interface UpdateStateView {
   current_version: string;
   available_version?: string | null;
   channel: string;
+  /// Verdict of the last snapshot restore. A restore stops and restarts the
+  /// panel, so its outcome cannot come back through the request that began it —
+  /// the backend reads it from a file the restore writes on every exit path.
+  last_restore?: {
+    snapshot_id: string;
+    ok: boolean;
+    stage: string;
+    detail: string;
+    finished_at: string;
+  } | null;
 }
 
 interface FleetRunRow {
@@ -792,6 +802,33 @@ export default function Telemetry() {
                 {creatingSnapshot ? "Snapshotting..." : "Snapshot Now"}
               </button>
             </div>
+            {/* Outcome of the last restore. A rollback stops the panel, so the
+                request that starts it can never report how it went — without
+                this the operator cannot tell a failed rollback from one that
+                never ran. Shown for failures AND successes. */}
+            {updateState?.last_restore && (
+              <div className={`mb-3 rounded-lg border px-3 py-2 text-xs ${
+                updateState.last_restore.ok
+                  ? "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
+                  : "bg-red-500/10 border-red-500/30 text-red-300"
+              }`}>
+                <div className="font-medium">
+                  {updateState.last_restore.ok
+                    ? "Last rollback completed"
+                    : `Last rollback FAILED at stage "${updateState.last_restore.stage}"`}
+                </div>
+                <div className="mt-1 text-dark-300 break-words">{updateState.last_restore.detail}</div>
+                {!updateState.last_restore.ok && (
+                  <div className="mt-1 text-dark-400">
+                    The database is applied in a single transaction — a failure before the
+                    "database" stage completes leaves it exactly as it was.
+                  </div>
+                )}
+                <div className="mt-1 font-mono text-[10px] text-dark-500">
+                  {updateState.last_restore.snapshot_id} · {new Date(updateState.last_restore.finished_at).toLocaleString()}
+                </div>
+              </div>
+            )}
             {snapshots.length === 0 ? (
               <div className="text-xs text-dark-400 py-3 text-center">
                 No snapshots yet. Pre-update snapshots appear here automatically when you Apply Update.
