@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.0] - 2026-07-19
+
+Three community-requested enhancements
+([#67](https://github.com/ovexro/dockpanel/issues/67),
+[#63](https://github.com/ovexro/dockpanel/issues/63),
+[#50](https://github.com/ovexro/dockpanel/issues/50)/[#58](https://github.com/ovexro/dockpanel/issues/58)).
+
+### Added
+- **The dashboard status widgets are now clickable**
+  ([#67](https://github.com/ovexro/dockpanel/issues/67)). The overview
+  status cells (Health, Alerts, SSL, Incidents, Backups, Sites,
+  Databases, Docker), the "Degraded Performance" status banner, and each
+  Smart Recommendation row now link straight to the page that resolves
+  them — a "critical diagnostic issue" recommendation opens System
+  Diagnostics, an open incident opens the Status Page, an SSL warning
+  opens Certificates, and the Health score opens the diagnostics that
+  drive it. Previously these were dead-ends with no indication of what
+  they referred to or how to act on them. The Monitoring and Security
+  pages now accept a `?tab=` query parameter so these links land on the
+  correct sub-tab.
+- **PowerDNS SQLite backend option**
+  ([#63](https://github.com/ovexro/dockpanel/issues/63)). The one-click
+  PowerDNS installer now offers a choice of **SQLite** (no database
+  server required) or PostgreSQL. SQLite removes the dependency on the
+  panel's containerized PostgreSQL — the coupling that could make the
+  PostgreSQL install silently fail — and has a minimal footprint that
+  suits most deployments. The installer's manual setup guide was also
+  corrected: it previously instructed `sudo -u postgres createdb pdns`
+  on localhost, which cannot work because DockPanel's PostgreSQL runs in
+  a Docker container, not on the host.
+- **AzuraCast app template**
+  ([#50](https://github.com/ovexro/dockpanel/issues/50) /
+  [#58](https://github.com/ovexro/dockpanel/issues/58)). One-click deploy
+  for the AzuraCast self-hosted web-radio suite (Media category).
+
 ## [2.10.2] - 2026-06-07
 
 Fixes two fresh-install blockers reported in

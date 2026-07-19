@@ -316,6 +316,17 @@ static TEMPLATES: &[AppTemplateDef] = &[
         volumes: &[],
     },
     AppTemplateDef {
+        id: "azuracast",
+        name: "AzuraCast",
+        description: "Self-hosted web radio suite — station management, streaming, playlists, and listener stats in one all-in-one container",
+        category: "Media",
+        image: "ghcr.io/azuracast/azuracast:stable",
+        default_port: 8420,
+        container_port: "80/tcp",
+        env_vars: &[],
+        volumes: &["/var/azuracast"],
+    },
+    AppTemplateDef {
         id: "redis",
         name: "Redis",
         description: "In-memory data store for caching and message brokering",

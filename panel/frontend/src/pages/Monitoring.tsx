@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useSearchParams } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import MonitorsContent from "./Monitors";
 import AlertsContent from "./Alerts";
@@ -6,11 +7,28 @@ import CertificatesContent from "./Certificates";
 import MaintenanceContent from "./Maintenance";
 import IncidentManagementContent from "./IncidentManagement";
 
+type MonitoringTab = "monitors" | "alerts" | "certificates" | "maintenance" | "statuspage";
+const MONITORING_TABS: readonly string[] = ["monitors", "alerts", "certificates", "maintenance", "statuspage"];
+
 export default function Monitoring() {
   const { user } = useAuth();
-  const [tab, setTab] = useState<"monitors" | "alerts" | "certificates" | "maintenance" | "statuspage">("monitors");
-
   const isAdmin = user?.role === "admin";
+  const [searchParams] = useSearchParams();
+
+  // Deep-linkable tab (e.g. /monitoring?tab=alerts from the dashboard). Non-admins
+  // can't see the Status Page tab, so clamp it back to Monitors for them.
+  const resolveTab = (raw: string | null): MonitoringTab => {
+    if (raw && MONITORING_TABS.includes(raw)) {
+      if (raw === "statuspage" && !isAdmin) return "monitors";
+      return raw as MonitoringTab;
+    }
+    return "monitors";
+  };
+  const [tab, setTab] = useState<MonitoringTab>(() => resolveTab(searchParams.get("tab")));
+  useEffect(() => {
+    setTab(resolveTab(searchParams.get("tab")));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams, isAdmin]);
 
   return (
     <div className="p-6 lg:p-8">

@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Navigate } from "react-router-dom";
+import { Navigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import { api } from "../api";
 import DiagnosticsContent from "./Diagnostics";
@@ -127,7 +127,17 @@ export default function Security() {
   const [ruleFrom, setRuleFrom] = useState("");
   const [deleteTarget, setDeleteTarget] = useState<number | null>(null);
   const [message, setMessage] = useState({ text: "", type: "" });
-  const [tab, setTab] = useState<"overview" | "scans" | "diagnostics" | "audit" | "lockdown" | "recordings" | "approvals">("overview");
+  const [searchParams] = useSearchParams();
+  const SEC_TABS = ["overview", "scans", "diagnostics", "audit", "lockdown", "recordings", "approvals"] as const;
+  type SecTab = typeof SEC_TABS[number];
+  const resolveSecTab = (raw: string | null): SecTab =>
+    raw && (SEC_TABS as readonly string[]).includes(raw) ? (raw as SecTab) : "overview";
+  // Deep-linkable tab (e.g. /security?tab=diagnostics from the dashboard).
+  const [tab, setTab] = useState<SecTab>(() => resolveSecTab(searchParams.get("tab")));
+  useEffect(() => {
+    setTab(resolveSecTab(searchParams.get("tab")));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
   const [loginAudit, setLoginAudit] = useState<{ panel: PanelLoginEntry[]; ssh: SshLoginEntry[] }>({ panel: [], ssh: [] });
 
   // Security Hardening state (consolidated from SecurityHardening.tsx)

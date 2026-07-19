@@ -518,7 +518,14 @@ pub async fn install_powerdns(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
+    body: axum::body::Bytes,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    // Optional {"backend":"sqlite"|"pgsql"} forwarded to the agent (issue #63).
+    // Absent/invalid → None, so the agent applies its pgsql default (back-compat).
+    let forward_body = serde_json::from_slice::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.get("backend").and_then(|b| b.as_str()).map(str::to_string))
+        .filter(|b| b == "sqlite" || b == "pgsql")
+        .map(|b| serde_json::json!({ "backend": b }));
     let install_id = Uuid::new_v4();
 
     let (tx, _) = broadcast::channel::<ProvisionStep>(32);
@@ -551,7 +558,7 @@ pub async fn install_powerdns(
 
         emit("install", "Installing PowerDNS", "in_progress", None);
 
-        match agent.post("/services/install/powerdns", None).await {
+        match agent.post("/services/install/powerdns", forward_body).await {
             Ok(result) => {
                 // Auto-save API URL and key to settings
                 if let (Some(url), Some(key)) = (

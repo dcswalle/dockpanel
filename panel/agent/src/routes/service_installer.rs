@@ -298,14 +298,26 @@ enabled = true
 
 // ── PowerDNS installer ──────────────────────────────────────────────────
 
-async fn install_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
-    tracing::info!("Installing PowerDNS...");
+async fn install_powerdns(body: axum::body::Bytes) -> Result<Json<serde_json::Value>, ApiErr> {
+    // Optional JSON body {"backend": "sqlite" | "pgsql"}. Absent/empty/invalid → pgsql
+    // (back-compat: older panels POST no body). SQLite removes the dependency on the
+    // panel's containerized PostgreSQL that broke installs in issue #63.
+    let use_sqlite = serde_json::from_slice::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.get("backend").and_then(|b| b.as_str()).map(str::to_string))
+        .as_deref() == Some("sqlite");
+    let backend_name = if use_sqlite { "sqlite" } else { "pgsql" };
+    tracing::info!("Installing PowerDNS (backend={backend_name})...");
 
-    // 1. Install packages
+    // 1. Install packages (backend-specific)
+    let pkgs = if use_sqlite {
+        "pdns-server pdns-backend-sqlite3 sqlite3"
+    } else {
+        "pdns-server pdns-backend-pgsql"
+    };
     let output = tokio::time::timeout(
         Duration::from_secs(300),
         safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y pdns-server pdns-backend-pgsql"])
+            .args(["-c", &format!("DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confnew install -y {pkgs}")])
             .output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PowerDNS install timed out after 300s"))?
@@ -316,64 +328,107 @@ async fn install_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS install failed: {}", stderr.chars().take(300).collect::<String>())));
     }
 
-    // 2. Create a PostgreSQL database for PowerDNS using the existing panel DB container
-    let db_exists = tokio::time::timeout(
-        Duration::from_secs(120),
-        safe_command("docker")
-            .args(["exec", "dockpanel-postgres", "psql", "-U", "dockpanel", "-lqt"])
-            .output()
-    ).await
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("pdns"))
-        .unwrap_or(false);
-
-    if !db_exists {
-        let _ = tokio::time::timeout(
-            Duration::from_secs(120),
-            safe_command("docker")
-                .args(["exec", "dockpanel-postgres", "psql", "-U", "dockpanel", "-c", "CREATE DATABASE pdns;"])
-                .output()
-        ).await;
-
-        // Load PowerDNS schema
-        let schema_path = "/usr/share/doc/pdns-backend-pgsql/schema.pgsql.sql";
-        if tokio::fs::metadata(schema_path).await.is_ok() {
-            // Use shell pipe to feed schema to psql
-            let _ = tokio::time::timeout(
-                Duration::from_secs(120),
-                safe_command_unsandboxed("sh", &[])
-                    .args(["-c", &format!("cat {} | docker exec -i dockpanel-postgres psql -U dockpanel -d pdns", schema_path)])
-                    .output()
-            ).await;
-        }
-    }
-
-    // 3. Generate API key and read DB password from environment
+    // 2. Generate the HTTP-API key (shared by both backends)
     let api_key: String = {
         use rand::Rng;
         let mut rng = rand::rng();
         (0..32).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
     };
-    // Use the same DB password as the panel's postgres connection (never hardcode)
-    let pdns_db_password = std::env::var("PANEL_DB_PASSWORD")
-        .or_else(|_| {
-            // Fall back: extract password from DATABASE_URL if set
-            std::env::var("DATABASE_URL").map(|url| {
-                url.split("://").nth(1).unwrap_or("")
-                    .split('@').next().unwrap_or("")
-                    .split(':').nth(1).unwrap_or("").to_string()
-            })
-        })
-        .unwrap_or_else(|_| {
-            // Last resort: generate a random password
-            use rand::Rng;
-            let mut rng = rand::rng();
-            (0..32).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
-        });
 
-    // 4. Write PowerDNS config
-    let pdns_conf = format!(r#"# DockPanel PowerDNS configuration
+    // 3. Backend-specific storage setup
+    if use_sqlite {
+        // /var/lib/powerdns is NOT in the agent's ReadWritePaths, so create the DB
+        // and load the schema via the unsandboxed escape hatch (same mechanism apt
+        // uses above) — otherwise ProtectSystem=strict EROFS's the write. The schema
+        // ships with pdns-backend-sqlite3 (plain or gzipped depending on distro).
+        let setup = "mkdir -p /var/lib/powerdns; \
+            SCHEMA=/usr/share/doc/pdns-backend-sqlite3/schema.sqlite3.sql; \
+            if [ ! -s /var/lib/powerdns/pdns.sqlite3 ]; then \
+              if [ -f \"$SCHEMA\" ]; then sqlite3 /var/lib/powerdns/pdns.sqlite3 < \"$SCHEMA\"; \
+              elif [ -f \"$SCHEMA.gz\" ]; then zcat \"$SCHEMA.gz\" | sqlite3 /var/lib/powerdns/pdns.sqlite3; fi; \
+            fi; \
+            chown -R pdns:pdns /var/lib/powerdns";
+        let sql_out = tokio::time::timeout(
+            Duration::from_secs(120),
+            safe_command_unsandboxed("sh", &[]).args(["-c", setup]).output()
+        ).await
+            .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PowerDNS SQLite schema load timed out"))?
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("SQLite setup failed: {e}")))?;
+        if !sql_out.status.success() {
+            let stderr = String::from_utf8_lossy(&sql_out.stderr);
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("PowerDNS SQLite setup failed: {}", stderr.chars().take(300).collect::<String>())));
+        }
+    } else {
+        // Create the pdns database in the panel's PostgreSQL container + load schema.
+        let db_exists = tokio::time::timeout(
+            Duration::from_secs(120),
+            safe_command("docker")
+                .args(["exec", "dockpanel-postgres", "psql", "-U", "dockpanel", "-lqt"])
+                .output()
+        ).await
+            .ok()
+            .and_then(|r| r.ok())
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("pdns"))
+            .unwrap_or(false);
+
+        if !db_exists {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(120),
+                safe_command("docker")
+                    .args(["exec", "dockpanel-postgres", "psql", "-U", "dockpanel", "-c", "CREATE DATABASE pdns;"])
+                    .output()
+            ).await;
+
+            // Load PowerDNS schema
+            let schema_path = "/usr/share/doc/pdns-backend-pgsql/schema.pgsql.sql";
+            if tokio::fs::metadata(schema_path).await.is_ok() {
+                // Use shell pipe to feed schema to psql
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    safe_command_unsandboxed("sh", &[])
+                        .args(["-c", &format!("cat {} | docker exec -i dockpanel-postgres psql -U dockpanel -d pdns", schema_path)])
+                        .output()
+                ).await;
+            }
+        }
+    }
+
+    // 4. Build the backend-specific config
+    let pdns_conf = if use_sqlite {
+        format!(r#"# DockPanel PowerDNS configuration (SQLite backend)
+launch=gsqlite3
+gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+
+# HTTP API
+api=yes
+api-key={api_key}
+webserver=yes
+webserver-address=127.0.0.1
+webserver-port=8081
+webserver-allow-from=127.0.0.1
+
+# SOA defaults
+default-soa-content=ns1.@ hostmaster.@ 0 10800 3600 604800 3600
+"#)
+    } else {
+        // Use the same DB password as the panel's postgres connection (never hardcode)
+        let pdns_db_password = std::env::var("PANEL_DB_PASSWORD")
+            .or_else(|_| {
+                // Fall back: extract password from DATABASE_URL if set
+                std::env::var("DATABASE_URL").map(|url| {
+                    url.split("://").nth(1).unwrap_or("")
+                        .split('@').next().unwrap_or("")
+                        .split(':').nth(1).unwrap_or("").to_string()
+                })
+            })
+            .unwrap_or_else(|_| {
+                // Last resort: generate a random password
+                use rand::Rng;
+                let mut rng = rand::rng();
+                (0..32).map(|_| rng.sample(rand::distr::Alphanumeric) as char).collect()
+            });
+
+        format!(r#"# DockPanel PowerDNS configuration
 launch=gpgsql
 gpgsql-host=127.0.0.1
 gpgsql-port=5450
@@ -391,22 +446,25 @@ webserver-allow-from=127.0.0.1
 
 # SOA defaults
 default-soa-content=ns1.@ hostmaster.@ 0 10800 3600 604800 3600
-"#);
+"#)
+    };
 
+    // 5. Write PowerDNS config (/etc/powerdns is in the agent's ReadWritePaths)
     tokio::fs::write("/etc/powerdns/pdns.conf", &pdns_conf).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write pdns.conf: {e}")))?;
 
-    // 5. Enable and start
+    // 6. Enable and start
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["enable", "pdns"]).output()).await;
     let _ = tokio::time::timeout(Duration::from_secs(120), safe_command("systemctl").args(["restart", "pdns"]).output()).await;
 
-    tracing::info!("PowerDNS installed with API key");
+    tracing::info!("PowerDNS installed with API key (backend={backend_name})");
 
     Ok(Json(serde_json::json!({
         "ok": true,
-        "message": "PowerDNS installed and configured",
+        "message": format!("PowerDNS installed and configured ({backend_name} backend)"),
         "api_url": "http://127.0.0.1:8081",
         "api_key": api_key,
+        "backend": backend_name,
     })))
 }
 
@@ -657,7 +715,7 @@ async fn uninstall_powerdns() -> Result<Json<serde_json::Value>, ApiErr> {
     let output = tokio::time::timeout(
         Duration::from_secs(300),
         safe_command_unsandboxed("sh", &[])
-            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y pdns-server pdns-backend-pgsql && apt-get autoremove -y"])
+            .args(["-c", "DEBIAN_FRONTEND=noninteractive apt-get purge -y pdns-server pdns-backend-pgsql pdns-backend-sqlite3 && apt-get autoremove -y"])
             .output()
     ).await
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "PowerDNS uninstall timed out after 300s"))?

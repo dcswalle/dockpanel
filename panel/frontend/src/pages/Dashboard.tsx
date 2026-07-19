@@ -130,6 +130,17 @@ interface Recommendation {
   action: string;
 }
 
+// Maps a recommendation's `action` (emitted by GET /api/dashboard/intelligence)
+// to the page that resolves it, so dashboard rows become drill-in links (#67).
+const REC_ACTION_ROUTES: Record<string, string> = {
+  backup: "/backup-orchestrator",
+  security: "/security",
+  diagnostics: "/security?tab=diagnostics",
+  incidents: "/monitoring?tab=statuspage",
+  ssl: "/monitoring?tab=certificates",
+  alerts: "/monitoring?tab=alerts",
+};
+
 interface Intelligence {
   health_score: number;
   grade: string;
@@ -507,10 +518,10 @@ export default function Dashboard() {
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {intel && (
-            <span className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium ${overallStatus.color}`}>
+            <Link to="/monitoring" title="View monitoring & system status" className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-medium hover:opacity-80 transition-opacity ${overallStatus.color}`}>
               <span className={`w-1.5 h-1.5 rounded-full ${overallStatus.dot} ${overallStatus.dot === "bg-rust-500" ? "animate-pulse" : ""}`} />
               {overallStatus.label}
-            </span>
+            </Link>
           )}
           <div className="h-4 w-px bg-dark-600 hidden sm:block" />
           <button onClick={() => setShowWidgetConfig(!showWidgetConfig)}
@@ -832,24 +843,24 @@ export default function Dashboard() {
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Uptime</span>
               <span className="text-sm text-dark-50 font-medium">{formatUptime(system.uptime_secs)}</span>
             </div>
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+            <Link to="/sites" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Sites</span>
               <span className="text-sm text-dark-50 font-medium">{sites.total}{sites.active > 0 && <span className="text-rust-400 ml-1 text-xs">({sites.active} active)</span>}</span>
-            </div>
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+            </Link>
+            <Link to="/databases" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Databases</span>
               <span className="text-sm text-dark-50 font-medium">{dbCount}</span>
-            </div>
+            </Link>
             {/* Feature #1: Docker container overview */}
-            <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+            <Link to="/apps" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Docker</span>
               <span className="text-sm text-dark-50 font-medium">
                 {dockerInfo?.running ?? 0}<span className="text-xs text-dark-300 font-normal">/{dockerInfo?.total ?? 0}</span>
                 <span className="text-[10px] text-dark-400 ml-1">running</span>
               </span>
-            </div>
+            </Link>
             {intel && <>
-              <div className={`px-4 py-3 flex flex-col card-interactive ${
+              <Link to="/security?tab=diagnostics" title="View system diagnostics that drive this score" className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.health_score < 60 ? "bg-danger-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Health</span>
@@ -858,8 +869,8 @@ export default function Dashboard() {
                   intel.health_score >= 75 ? "text-accent-400" :
                   intel.health_score >= 60 ? "text-warn-400" : "text-danger-400"
                 }`}>{intel.health_score}/100 {intel.grade}</span>
-              </div>
-              <div className={`px-4 py-3 flex flex-col card-interactive ${
+              </Link>
+              <Link to="/monitoring?tab=alerts" className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.firing_alerts > 0 ? "bg-danger-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Alerts</span>
@@ -867,12 +878,12 @@ export default function Dashboard() {
                   ? <span className="text-sm text-danger-400 font-bold">{intel.firing_alerts} firing</span>
                   : <span className="text-sm text-rust-400 font-medium">0</span>
                 }
-              </div>
-              <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
+              </Link>
+              <Link to="/monitoring?tab=certificates" className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">SSL</span>
                 <span className="text-sm text-dark-50 font-medium">{intel.ssl_countdowns.length} certs</span>
-              </div>
-              <div className={`px-4 py-3 flex flex-col card-interactive ${
+              </Link>
+              <Link to="/monitoring?tab=statuspage" className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.open_incidents > 0 ? "bg-danger-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Incidents</span>
@@ -880,8 +891,8 @@ export default function Dashboard() {
                   ? <span className="text-sm text-danger-400 font-bold">{intel.open_incidents} open</span>
                   : <span className="text-sm text-rust-400 font-medium">0</span>
                 }
-              </div>
-              <div className={`px-4 py-3 flex flex-col card-interactive ${
+              </Link>
+              <Link to="/backup-orchestrator" className={`px-4 py-3 flex flex-col card-interactive ${
                 intel.stale_backups > 0 ? "bg-warn-500/5" : "bg-dark-800"
               }`}>
                 <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Backups</span>
@@ -889,7 +900,7 @@ export default function Dashboard() {
                   ? <span className="text-sm text-warn-400 font-bold">{intel.stale_backups} stale</span>
                   : <span className="text-sm text-rust-400 font-medium">fresh</span>
                 }
-              </div>
+              </Link>
             </>}
             <div className="bg-dark-800 px-4 py-3 flex flex-col card-interactive">
               <span className="text-[10px] text-dark-300 uppercase tracking-widest mb-1">Updates</span>
@@ -1033,24 +1044,39 @@ export default function Dashboard() {
                 <span className="text-[10px] text-dark-400">{intel.recommendations.length} item{intel.recommendations.length !== 1 ? "s" : ""}</span>
               </div>
               <div className="divide-y divide-dark-600">
-                {intel.recommendations.map((rec, i) => (
-                  <div key={i} className="px-4 py-3 flex items-start gap-3">
-                    <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
-                      rec.severity === "critical" ? "bg-danger-500" :
-                      rec.severity === "warning" ? "bg-warn-500" : "bg-accent-500"
-                    }`} />
-                    <div className="flex-1 min-w-0">
-                      <p className={`text-xs leading-tight ${
-                        rec.severity === "critical" ? "text-danger-400" :
-                        rec.severity === "warning" ? "text-warn-400" : "text-dark-100"
-                      }`}>{rec.message}</p>
+                {intel.recommendations.map((rec, i) => {
+                  const route = REC_ACTION_ROUTES[rec.action];
+                  const inner = (
+                    <>
+                      <div className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${
+                        rec.severity === "critical" ? "bg-danger-500" :
+                        rec.severity === "warning" ? "bg-warn-500" : "bg-accent-500"
+                      }`} />
+                      <div className="flex-1 min-w-0">
+                        <p className={`text-xs leading-tight ${
+                          rec.severity === "critical" ? "text-danger-400" :
+                          rec.severity === "warning" ? "text-warn-400" : "text-dark-100"
+                        }`}>{rec.message}</p>
+                      </div>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wider font-bold flex-shrink-0 ${
+                        rec.severity === "critical" ? "bg-danger-500/10 text-danger-400" :
+                        rec.severity === "warning" ? "bg-warn-500/10 text-warn-400" : "bg-accent-500/10 text-accent-400"
+                      }`}>{rec.severity}</span>
+                      {route && (
+                        <svg className="w-3.5 h-3.5 text-dark-400 flex-shrink-0 mt-0.5 group-hover:text-dark-200 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true"><path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" /></svg>
+                      )}
+                    </>
+                  );
+                  return route ? (
+                    <Link key={i} to={route} className="px-4 py-3 flex items-start gap-3 hover:bg-dark-700/50 transition-colors group">
+                      {inner}
+                    </Link>
+                  ) : (
+                    <div key={i} className="px-4 py-3 flex items-start gap-3">
+                      {inner}
                     </div>
-                    <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wider font-bold flex-shrink-0 ${
-                      rec.severity === "critical" ? "bg-danger-500/10 text-danger-400" :
-                      rec.severity === "warning" ? "bg-warn-500/10 text-warn-400" : "bg-accent-500/10 text-accent-400"
-                    }`}>{rec.severity}</span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

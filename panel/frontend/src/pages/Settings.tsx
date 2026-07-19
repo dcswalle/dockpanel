@@ -2284,13 +2284,15 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
 
   useEffect(refreshStatus, []);
 
-  const install = async (service: string, _label: string) => {
+  const [pdnsBackend, setPdnsBackend] = useState<"sqlite" | "pgsql">("sqlite");
+
+  const install = async (service: string, _label: string, body?: Record<string, unknown>) => {
     setInstalling(service);
     setInstallId(null);
     setMsg({ text: "", type: "" });
     try {
       const endpoint = service === "mail" ? "/mail/install" : `/services/install/${service}`;
-      const result = await api.post<{ install_id?: string }>(endpoint, {});
+      const result = await api.post<{ install_id?: string }>(endpoint, body ?? {});
       if (result.install_id) {
         setInstallId(result.install_id);
       } else {
@@ -2400,7 +2402,7 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
             <p><span className="text-dark-100 font-medium">Certbot</span> — Installs Let's Encrypt certbot with nginx plugin. Enables auto-renewal timer. Required for free SSL certificates.</p>
             <p><span className="text-dark-100 font-medium">UFW</span> — Installs firewall, opens SSH/HTTP/HTTPS/SMTP/IMAPS ports, enables with deny-by-default policy.</p>
             <p><span className="text-dark-100 font-medium">Fail2Ban</span> — Installs intrusion prevention. Creates jails for SSH brute-force, nginx auth failures, Postfix, and Dovecot.</p>
-            <p><span className="text-dark-100 font-medium">PowerDNS</span> — Installs authoritative DNS server with PostgreSQL backend. Auto-configures HTTP API and saves credentials to Settings.</p>
+            <p><span className="text-dark-100 font-medium">PowerDNS</span> — Installs an authoritative DNS server with your choice of SQLite (no database server required) or PostgreSQL backend. Auto-configures the HTTP API and saves credentials to Settings.</p>
             <p><span className="text-dark-100 font-medium">Mail Server</span> — Installs Postfix (SMTP), Dovecot (IMAP/POP3), and OpenDKIM (DKIM signing). Creates vmail user, configures virtual mailbox hosting with SASL auth and submission port (587). Manage domains and mailboxes from the Mail page.</p>
             <p><span className="text-dark-100 font-medium">Redis</span> — Installs Redis in-memory data store. Used as cache backend for PHP applications (WordPress object cache, Laravel, Drupal). Runs as a systemd service on port 6379.</p>
             <p><span className="text-dark-100 font-medium">Node.js</span> — Installs Node.js 22 LTS and npm via NodeSource. Used for build tools, SSR frameworks (Next.js, Nuxt), and running JavaScript/TypeScript applications.</p>
@@ -2416,7 +2418,7 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
 
             return (
               <div key={svc.id} className="border border-dark-500 bg-dark-900/50 p-4 flex items-center justify-between">
-                <div>
+                <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium text-dark-50">{svc.label}</span>
                     {extra && <span className="text-[10px] text-dark-300">{extra}</span>}
@@ -2425,6 +2427,23 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
                     )}
                   </div>
                   <p className="text-[10px] text-dark-300 mt-0.5">{svc.desc}</p>
+                  {svc.id === "powerdns" && !installed && (
+                    <div className="flex items-center gap-1.5 mt-2">
+                      <span className="text-[10px] text-dark-400 uppercase tracking-wider">Backend</span>
+                      <div className="flex items-center rounded-lg border border-dark-600 overflow-hidden text-[10px] font-medium" title="SQLite needs no database server and is recommended for most setups.">
+                        <button
+                          type="button"
+                          onClick={() => setPdnsBackend("sqlite")}
+                          className={`px-2 py-1 ${pdnsBackend === "sqlite" ? "bg-dark-600 text-dark-50" : "bg-dark-800 text-dark-400 hover:text-dark-200"}`}
+                        >SQLite</button>
+                        <button
+                          type="button"
+                          onClick={() => setPdnsBackend("pgsql")}
+                          className={`px-2 py-1 ${pdnsBackend === "pgsql" ? "bg-dark-600 text-dark-50" : "bg-dark-800 text-dark-400 hover:text-dark-200"}`}
+                        >PostgreSQL</button>
+                      </div>
+                    </div>
+                  )}
                 </div>
                 {installed ? (
                   <div className="flex items-center gap-2 shrink-0 ml-3">
@@ -2441,7 +2460,7 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
                   </div>
                 ) : (
                   <button
-                    onClick={() => install(svc.id, svc.label)}
+                    onClick={() => install(svc.id, svc.label, svc.id === "powerdns" ? { backend: pdnsBackend } : undefined)}
                     disabled={installing !== null}
                     className="px-3 py-1.5 bg-rust-500 text-white rounded-lg text-xs font-medium hover:bg-rust-600 disabled:opacity-50 shrink-0 ml-3"
                   >
@@ -2470,18 +2489,18 @@ function ServiceInstallers({ pdnsApiUrl, setPdnsApiUrl, pdnsApiKey, setPdnsApiKe
 
           {showPdnsGuide && (
             <div className="bg-dark-900 border border-dark-500 p-4 space-y-3 text-sm">
-              <p className="text-dark-200 font-medium">Install PowerDNS with PostgreSQL backend:</p>
-              <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`# Install PowerDNS
-apt install pdns-server pdns-backend-pgsql
+              <p className="text-dark-200">The one-click <span className="text-dark-100 font-medium">Install</span> button above does all of this for you — choose <span className="text-dark-100 font-mono">SQLite</span> (no database server needed, recommended for most setups) or <span className="text-dark-100 font-mono">PostgreSQL</span>, and the API URL + key are generated and saved automatically.</p>
+              <p className="text-dark-200 font-medium">Prefer to set it up by hand? SQLite backend:</p>
+              <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`# Install PowerDNS with the SQLite backend
+apt install pdns-server pdns-backend-sqlite3 sqlite3
 
-# Create a database for PowerDNS
-sudo -u postgres createdb pdns
-sudo -u postgres psql pdns < /usr/share/doc/pdns-backend-pgsql/schema.pgsql.sql`}</pre>
+# Create the database from the bundled schema
+mkdir -p /var/lib/powerdns
+sqlite3 /var/lib/powerdns/pdns.sqlite3 < /usr/share/doc/pdns-backend-sqlite3/schema.sqlite3.sql
+chown -R pdns:pdns /var/lib/powerdns`}</pre>
               <p className="text-dark-200 font-medium">Configure <span className="text-dark-100 font-mono">/etc/powerdns/pdns.conf</span>:</p>
-              <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`launch=gpgsql
-gpgsql-host=127.0.0.1
-gpgsql-dbname=pdns
-gpgsql-user=postgres
+              <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`launch=gsqlite3
+gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
 
 # Enable HTTP API
 api=yes
@@ -2490,6 +2509,7 @@ webserver=yes
 webserver-address=127.0.0.1
 webserver-port=8081
 webserver-allow-from=127.0.0.1`}</pre>
+              <p className="text-xs text-dark-300">Prefer PostgreSQL? DockPanel's database runs in the <span className="font-mono text-dark-200">dockpanel-postgres</span> container, not on localhost — so <span className="font-mono text-dark-200">sudo -u postgres createdb pdns</span> won't work. Use the one-click installer's PostgreSQL option (it creates the <span className="font-mono text-dark-200">pdns</span> database inside the container for you).</p>
               <p className="text-dark-200 font-medium">Then restart and verify:</p>
               <pre className="bg-dark-950 border border-dark-600 p-3 text-xs text-dark-100 font-mono overflow-x-auto whitespace-pre">{`systemctl restart pdns
 curl -s -H "X-API-Key: your-secret-key-here" \\
