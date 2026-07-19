@@ -6,6 +6,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.5] - 2026-07-19
+
+Snapshot restore works. It never had — every pre-update snapshot the panel has
+taken since v2.10.0 was unrestorable, and the way it failed was worse than not
+working at all: on a lab box it reduced a 92-table database to 1 table and
+reported the restore as a success. This release was driven by running the path,
+not by reading it.
+
+### Fixed
+
+- **`POST /api/update/rollback` destroyed the database and reported success.**
+  The restore ran inline inside the HTTP request handler, so it competed with the
+  panel's own 300-second request timeout (and nginx's `proxy_read_timeout`); a
+  restore measured at 394 seconds on a lab box, so the request future was dropped
+  while psql was still consuming the dump. Dropping it broke the
+  `gunzip | psql` pipe, psql read that as a normal end of input and **exited 0**,
+  and the caller's `status.success()` check recorded a successful restore.
+  Because `pg_dump --clean` emits all 92 `DROP TABLE` statements before the first
+  `CREATE TABLE`, an interruption anywhere in that window leaves a database that
+  has been fully dropped and only partly rebuilt — measured at 1 surviving table
+  out of 92, with `servers`, `sites`, `metrics_history`, `backup_schedules` and
+  `backup_policies` among the casualties, which is exactly the damage reported
+  during the previous cycle's investigation.
+
+  Both halves are now closed. The restore runs as a PID1-owned transient systemd
+  unit (`scripts/restore-snapshot.sh`), so nothing can cancel it and it safely
+  outlives the api process it stops — the endpoint returns `202` immediately
+  instead of holding a request open across a service restart. The database is
+  applied with `ON_ERROR_STOP=1 --single-transaction`, so it either lands
+  completely or changes nothing. Verified both ways on a lab box against a
+  deliberately truncated stream: the old form exited 0 having left 1 of 92
+  tables; the new form exits non-zero with all 92 intact. As a side effect the
+  restore is also roughly forty times faster (394s to ~10s), because one
+  transaction commits once instead of fsyncing per statement.
+
+- **Snapshots could be created from an incomplete database dump.** The dump was
+  taken with `sh -c "pg_dump … | gzip > file"`, whose exit status is *gzip's* —
+  and gzip compresses a truncated stream and exits 0. A `pg_dump` that died
+  partway therefore produced a short dump that was stored as a valid snapshot
+  with a perfectly correct sha256 over perfectly incomplete contents. The dump
+  now runs under `bash` with `set -o pipefail`, and the snapshot is rejected
+  unless the dump carries pg_dump's completion marker. The restore re-checks the
+  same marker before it takes the panel down, so an incomplete dump can never
+  reach the destructive stage.
+
+- **A rollback was not recorded.** `rolled_back_at` was stamped before the
+  restore ran, and the restore replaces `panel_snapshots` with the snapshot's own
+  copy of itself — so the stamp was overwritten and lost every time (observed
+  coming back empty on a lab box). The restore now records it afterwards, in the
+  database it just restored.
+
+### Added
+
+- Every restore writes a verdict to `/var/lib/dockpanel/last-restore.json` on
+  every exit path, including an abort, and it is surfaced as `last_restore` on
+  `GET /api/update/status`. A restore stops and restarts the panel, so its
+  outcome cannot be returned through the request that began it; without this a
+  failed rollback and a rollback that never ran look identical.
+- A rollback now captures the pre-rollback database to
+  `/var/lib/dockpanel/pre-rollback-<id>.sql.gz` before applying the snapshot, so
+  a successful-but-regretted rollback is recoverable.
+
+### Known issues
+
+- A rollback restores what the snapshot *contains*. Because `pg_dump --clean`
+  can only drop objects it knows about, database objects created *after* a
+  snapshot survive a rollback to it while `_sqlx_migrations` is rewound — so a
+  later forward update to that same newer version can meet a migration whose
+  objects already exist. Nothing outside the snapshot (nginx vhosts, Let's
+  Encrypt certificates, site data, docker volumes) is rewound at all: a rollback
+  restores the panel, not the machine.
+
 ## [2.11.4] - 2026-07-19
 
 The panel's rollback safety net did not work. v2.11.3 made self-update complete
@@ -71,6 +143,8 @@ check rather than by reading the code.
   a worse one behind it: the restore then proceeds to leave the database with
   missing tables. It is deliberately left failing until the database-restore
   stage is fixed and verified; see the comment in `panel_snapshot.rs`.
+  *(Resolved in 2.11.5 — the database stage was the fault, and it was fixed and
+  verified end to end before the binary stage was unblocked.)*
 
 ## [2.11.3] - 2026-07-19
 

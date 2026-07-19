@@ -474,95 +474,34 @@ fn parse_target_from_trigger(trigger: &str) -> Option<String> {
     trigger.strip_prefix("pre-update:").map(|s| s.to_string())
 }
 
-/// Operator-triggered rollback. Stops services, restores binaries + DB +
-/// /etc from snapshot, restarts services. The api process this code runs
-/// in WILL be the one stopped — we shell out via setsid+nohup so the
-/// orchestrator's restore subprocess survives.
+/// Operator-triggered rollback. Validates the snapshot, then hands the whole
+/// restore — stop services, database, binaries, /etc, start services — to a
+/// detached PID1-owned unit and returns.
 ///
-/// Returns immediately once the rollback has been kicked off. Status is
-/// observed via the new process's [`current_state`] after restart.
+/// It CANNOT be awaited. The first thing the restore does is stop the api
+/// process this code is running in, so there is no "after" in which to observe
+/// it from here; the outcome is read back from
+/// [`panel_snapshot::last_restore_result`] once the panel is up again.
+///
+/// This shape is the fix, not an implementation detail. Until v2.11.5 the
+/// restore ran INLINE in the request handler, which meant:
+///   * it competed with the panel's own 300s HTTP timeout (`main.rs` TimeoutLayer
+///     and nginx `proxy_read_timeout`) — a restore measured at 394.9s on a lab
+///     box, so the future was dropped mid-flight;
+///   * dropping it broke the `gunzip | psql` pipe, which psql read as a normal
+///     end of input and exited 0 for, so the failure was recorded as a success;
+///   * the database was left with 1 of 92 tables while the panel reported the
+///     rollback had worked.
+/// Both halves are now closed: the work is detached (so nothing cancels it) and
+/// the database stage is atomic and verified (so it cannot half-apply).
 pub async fn rollback_to_snapshot(
     pool: PgPool,
     snapshot_id: Uuid,
 ) -> Result<(), OrchestratorError> {
-    // Fetch + validate snapshot upfront so the user gets a synchronous
-    // 4xx instead of a 202 + silent failure.
-    let snap: Option<PanelSnapshot> =
-        sqlx::query_as("SELECT * FROM panel_snapshots WHERE id = $1")
-            .bind(snapshot_id)
-            .fetch_optional(&pool)
-            .await?;
-    let snap = snap.ok_or_else(|| {
-        OrchestratorError::Snapshot(panel_snapshot::SnapshotError::NotFound(snapshot_id))
-    })?;
-    if !std::path::Path::new(&snap.file_path).exists() {
-        return Err(OrchestratorError::Snapshot(
-            panel_snapshot::SnapshotError::FileMissing(snap.file_path.clone().into()),
-        ));
-    }
-
-    // Run the restore in a detached shell process so the dockpanel-api
-    // restart we're about to issue doesn't kill the restore script
-    // partway through.
-    let helper = format!(
-        r#"#!/usr/bin/env bash
-set -e
-echo "[panel_update] rollback to snapshot {sid} starting" | systemd-cat -t dockpanel-rollback
-systemctl stop dockpanel-api dockpanel-agent || true
-sleep 1
-# Restore via dockpanel-cli helper (or fall back to manual extract+cp).
-{cli_invocation}
-systemctl daemon-reload
-systemctl start dockpanel-agent
-sleep 1
-systemctl start dockpanel-api
-echo "[panel_update] rollback to snapshot {sid} complete" | systemd-cat -t dockpanel-rollback
-"#,
-        sid = snapshot_id,
-        cli_invocation =
-            format!("/usr/local/bin/dockpanel snapshot-restore {snapshot_id} >> /var/log/dockpanel-rollback.log 2>&1 || true"),
-    );
-
-    // Use a one-shot helper file in /tmp so the detached process has a
-    // stable script path.
-    let helper_path = format!("/tmp/dockpanel-rollback-{snapshot_id}.sh");
-    tokio::fs::write(&helper_path, helper)
-        .await
-        .map_err(OrchestratorError::Spawn)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(
-            &helper_path,
-            std::fs::Permissions::from_mode(0o755),
-        );
-    }
-
-    // We CAN'T use the dockpanel-cli wrapper above on first ship — it
-    // doesn't have a snapshot-restore subcommand yet. Inline the restore
-    // by spawning the panel_snapshot path directly via a one-shot binary
-    // call. For W4 ship #1, call panel_snapshot::restore_snapshot before
-    // touching systemctl, then bounce services.
-    panel_snapshot::restore_snapshot(&pool, snapshot_id).await?;
-
-    // Bounce services via systemctl in a detached process so SIGTERM to
-    // dockpanel-api doesn't kill the restart command.
-    let mut bounce = Command::new("bash");
-    bounce
-        .arg("-c")
-        .arg("(systemctl restart dockpanel-agent dockpanel-api) </dev/null >/dev/null 2>&1 &")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        bounce.process_group(0);
-    }
-    let _ = bounce.spawn().map_err(OrchestratorError::Spawn)?;
-
-    // Clean up the helper file (no longer needed).
-    let _ = tokio::fs::remove_file(&helper_path).await;
-
+    // Everything cheap is validated synchronously so the operator gets a real
+    // 4xx now rather than a 202 and a result file to go hunting for. The row,
+    // the file on disk and its sha256 are all checked inside spawn_restore.
+    panel_snapshot::spawn_restore(&pool, snapshot_id).await?;
     Ok(())
 }
 

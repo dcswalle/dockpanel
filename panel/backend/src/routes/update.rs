@@ -27,6 +27,15 @@ pub struct StatusResponse {
     pub current_version: String,
     pub available_version: Option<String>,
     pub channel: String,
+    /// Verdict of the most recent snapshot restore, if one has ever run.
+    ///
+    /// A restore stops and restarts this process, so its outcome cannot be
+    /// returned through the request that started it — the restore writes a
+    /// result file and it is surfaced here. Always present after a restore,
+    /// including one that aborted partway, so a failed rollback can never look
+    /// like no rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_restore: Option<serde_json::Value>,
 }
 
 pub async fn get_status(
@@ -50,6 +59,7 @@ pub async fn get_status(
         current_version: env!("CARGO_PKG_VERSION").to_string(),
         available_version: available_version.map(|r| r.0),
         channel: channel.map(|r| r.0).unwrap_or_else(|| "stable".into()),
+        last_restore: panel_snapshot::last_restore_result().await,
     }))
 }
 

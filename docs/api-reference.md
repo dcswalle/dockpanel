@@ -783,7 +783,7 @@ reimplementing binary swap — every bug fix in update.sh keeps working.
 | GET    | `/api/update/status` | Current update state + version + channel |
 | POST   | `/api/update/manual-check` | Force a `/releases` poll now (bypasses `hold`) |
 | POST   | `/api/update/apply` | Snapshot + invoke update.sh. `{target_version: "v2.10.0"}` must match advertised version |
-| POST   | `/api/update/rollback` | Restore from snapshot. `{snapshot_id: "<uuid>"}`. Destructive — DB is also restored |
+| POST   | `/api/update/rollback` | Restore from snapshot. `{snapshot_id: "<uuid>"}`. Destructive — DB is also restored. Returns `202` immediately; see below |
 | GET    | `/api/update/channel` | Read current channel (`stable` \| `candidate` \| `hold`) |
 | PUT    | `/api/update/channel` | Set channel. `{channel: "candidate"}` |
 | GET    | `/api/snapshots` | List panel snapshots (newest first) |
@@ -792,6 +792,41 @@ reimplementing binary swap — every bug fix in update.sh keeps working.
 | GET    | `/api/update/fleet` | List recent fleet update runs |
 | POST   | `/api/update/fleet` | Start a fleet rolling update. `{target_version, halt_on_failure?, include_panel?}` |
 | GET    | `/api/update/fleet/{id}` | Fleet run detail (plan + per-server progress) |
+
+#### Rollback is asynchronous, and how you learn the outcome
+
+`POST /api/update/rollback` returns `202` as soon as the restore has been handed
+to a detached systemd unit. It cannot return the result: the first thing a
+restore does is stop `dockpanel-api`, so the process handling your request no
+longer exists by the time there is an outcome to report. Validation that *can*
+be done up front (snapshot exists, file present, sha256 matches) still happens
+synchronously, so a bad request is still a `404`/`410`/`5xx` immediately.
+
+Poll `GET /api/update/status` afterwards and read `last_restore`:
+
+```json
+{
+  "snapshot_id": "…",
+  "ok": true,
+  "stage": "complete",
+  "detail": "restored snapshot …; health: {\"status\":\"ok\"}",
+  "finished_at": "2026-07-19T18:16:34Z"
+}
+```
+
+`stage` names the step that was running when the restore stopped, so a failure
+says where it stopped and what was left untouched. The database is applied in a
+single transaction, so a rollback that fails during the database stage changes
+nothing at all. The same document is written to
+`/var/lib/dockpanel/last-restore.json` on the box.
+
+**What a rollback does and does not rewind.** It restores what the snapshot
+contains: the three binaries, `/etc/dockpanel`, and the database. Because the
+dump can only drop objects it knows about, database objects created *after* the
+snapshot survive the rollback. Nothing outside the snapshot — nginx vhosts,
+Let's Encrypt certificates, site files, docker volumes — is touched. A rollback
+restores the panel, not the machine. The pre-rollback database is saved to
+`/var/lib/dockpanel/pre-rollback-<id>.sql.gz` first.
 
 Agent-side (called by the orchestrator over the agent's bearer-auth API):
 

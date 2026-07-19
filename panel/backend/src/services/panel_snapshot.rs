@@ -225,12 +225,22 @@ async fn build_snapshot_inner(
         }
     }
 
-    // Dump DB via docker exec (matches scripts/update.sh:143 pattern).
+    // Dump DB via docker exec.
+    //
+    // `set -o pipefail` is load-bearing, not style. The exit status of
+    // `pg_dump | gzip` is gzip's, and gzip cheerfully compresses a truncated
+    // stream and exits 0 — so without it a pg_dump that died halfway (or never
+    // connected) produced a short dump, this check passed, and the snapshot was
+    // stored with a perfectly valid sha256 over perfectly incomplete contents.
+    // A backup that cannot be restored is worse than no backup, because the
+    // operator believes they are covered; the same one-character-class oversight
+    // on the restore side is what let a rollback destroy a live database while
+    // reporting success.
     let dump_path = staging_dir.join("db").join("dump.sql.gz");
-    let dump_status = Command::new("sh")
+    let dump_status = Command::new("bash")
         .arg("-c")
         .arg(format!(
-            "docker exec dockpanel-postgres pg_dump -U dockpanel --clean --if-exists dockpanel | gzip > {}",
+            "set -o pipefail; docker exec dockpanel-postgres pg_dump -U dockpanel --clean --if-exists dockpanel | gzip > {}",
             shell_escape(&dump_path.to_string_lossy())
         ))
         .status()
@@ -239,6 +249,26 @@ async fn build_snapshot_inner(
         return Err(SnapshotError::Subprocess {
             cmd: "pg_dump".into(),
             stderr: format!("exit status {dump_status}"),
+        });
+    }
+
+    // And prove what we just wrote is a whole dump before we let it become a
+    // snapshot. pg_dump emits this marker as its last line; its absence means
+    // the dump is short no matter what the exit statuses claimed.
+    let dump_tail = Command::new("bash")
+        .arg("-c")
+        .arg(format!(
+            "gunzip -c {} | tail -5",
+            shell_escape(&dump_path.to_string_lossy())
+        ))
+        .output()
+        .await?;
+    if !String::from_utf8_lossy(&dump_tail.stdout).contains("PostgreSQL database dump complete") {
+        return Err(SnapshotError::Subprocess {
+            cmd: "pg_dump".into(),
+            stderr: "database dump is incomplete (completion marker absent) — \
+                     refusing to store a snapshot that could not be restored"
+                .into(),
         });
     }
 
@@ -314,10 +344,34 @@ async fn build_snapshot_inner(
     Ok((size_bytes, sha256, from_version))
 }
 
-/// Restore a previously-created snapshot. Caller MUST stop dockpanel-agent
-/// + dockpanel-api before invoking this, and restart after. The DB restore
-/// is destructive (DROP + recreate via pg_dump --clean --if-exists).
-pub async fn restore_snapshot(pool: &PgPool, snapshot_id: Uuid) -> Result<(), SnapshotError> {
+/// The restore procedure, embedded at compile time.
+///
+/// Kept as a real file under `scripts/` so it is reviewable and testable, but
+/// compiled in rather than read from disk: `/opt/dockpanel` is not guaranteed to
+/// exist (hand-built layouts have no repo at all), and a repo-side script that
+/// the running binary merely *hopes* is in sync is the drift trap of lesson #35.
+const RESTORE_SCRIPT: &str = include_str!("../../../../scripts/restore-snapshot.sh");
+
+/// Where the restore writes its verdict. Read back by `last_restore_result`
+/// after the api has been restarted by the restore itself.
+pub const RESTORE_RESULT_PATH: &str = "/var/lib/dockpanel/last-restore.json";
+const RESTORE_SCRIPT_PATH: &str = "/var/lib/dockpanel/restore-snapshot.sh";
+
+/// Validate a snapshot and hand the restore to a detached, PID1-owned process.
+///
+/// Returns as soon as the restore has been *started* — it cannot be awaited,
+/// because the very first thing it does is stop the api process this code runs
+/// in. Everything that can be checked cheaply (row exists, file present, sha256
+/// matches) is checked HERE, synchronously, so the operator gets a real 4xx
+/// instead of a 202 followed by silence.
+///
+/// History, because the shape of this function is the fix: the restore used to
+/// run inline in the HTTP handler. It outlives the panel's own 300s request
+/// timeout (measured 394.9s on a lab box), so axum dropped the request future
+/// mid-restore, which broke the `gunzip | psql` pipe; psql read that as a clean
+/// end of input and exited 0, and the code recorded success while the database
+/// had been reduced to 1 of its 92 tables. See `scripts/restore-snapshot.sh`.
+pub async fn spawn_restore(pool: &PgPool, snapshot_id: Uuid) -> Result<(), SnapshotError> {
     let row: Option<PanelSnapshot> =
         sqlx::query_as("SELECT * FROM panel_snapshots WHERE id = $1")
             .bind(snapshot_id)
@@ -330,6 +384,10 @@ pub async fn restore_snapshot(pool: &PgPool, snapshot_id: Uuid) -> Result<(), Sn
         return Err(SnapshotError::FileMissing(file_path));
     }
 
+    // Verify before we hand off. The script re-verifies (it must — it is the one
+    // that acts), but failing here turns a corrupt snapshot into a synchronous
+    // error the operator sees immediately instead of a result file they have to
+    // go looking for.
     let actual_sha = sha256_of(&file_path).await?;
     if actual_sha != snapshot.sha256 {
         return Err(SnapshotError::Sha256Mismatch {
@@ -338,127 +396,67 @@ pub async fn restore_snapshot(pool: &PgPool, snapshot_id: Uuid) -> Result<(), Sn
         });
     }
 
-    // Extract to a fresh working dir so a partial restore doesn't leave
-    // garbage in /var/backups/dockpanel/snapshots itself.
-    let restore_dir =
-        PathBuf::from(STAGING_DIR_PARENT).join(format!("restore-{snapshot_id}"));
-    let _ = tokio::fs::remove_dir_all(&restore_dir).await;
-    tokio::fs::create_dir_all(&restore_dir).await?;
+    // NB: `rolled_back_at` is deliberately NOT stamped here. The restore replaces
+    // panel_snapshots with the snapshot's own copy of itself, so a stamp written
+    // before it runs is overwritten and lost (observed on a lab box: the column
+    // came back empty), and this process no longer exists afterwards to write
+    // one. The restore records it itself, into the database it just restored.
 
-    let extract_status = run_cmd_with_timeout(
-        "tar",
-        &[
-            "-C",
-            &restore_dir.to_string_lossy(),
-            "-xzf",
-            &file_path.to_string_lossy(),
-        ],
-        Duration::from_secs(300),
-    )
-    .await?;
-    if !extract_status.success() {
-        let _ = tokio::fs::remove_dir_all(&restore_dir).await;
+    tokio::fs::create_dir_all("/var/lib/dockpanel").await?;
+    tokio::fs::write(RESTORE_SCRIPT_PATH, RESTORE_SCRIPT).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(RESTORE_SCRIPT_PATH, std::fs::Permissions::from_mode(0o700))?;
+    }
+
+    // A PID1-owned transient SERVICE, not a scope and not a bare child: this
+    // process is about to stop dockpanel-api.service, and dockpanel-api.service
+    // is KillMode=control-group, so anything still inside that cgroup dies with
+    // it. `--scope` is not a substitute — it is created in the caller's context
+    // and dies with the invoking session (lesson #47).
+    let status = Command::new("systemd-run")
+        .args([
+            "--quiet",
+            "--collect",
+            &format!("--unit=dockpanel-snapshot-restore-{snapshot_id}"),
+            "--setenv=DOCKPANEL_RESTORE_DETACHED=1",
+            &format!("--setenv=DOCKPANEL_SNAPSHOT_ID={snapshot_id}"),
+            &format!(
+                "--setenv=DOCKPANEL_SNAPSHOT_TARBALL={}",
+                file_path.to_string_lossy()
+            ),
+            &format!("--setenv=DOCKPANEL_SNAPSHOT_SHA256={}", snapshot.sha256),
+            "bash",
+            RESTORE_SCRIPT_PATH,
+        ])
+        .status()
+        .await?;
+
+    if !status.success() {
         return Err(SnapshotError::Subprocess {
-            cmd: "tar -xzf".into(),
-            stderr: format!("exit status {extract_status}"),
+            cmd: "systemd-run (snapshot restore)".into(),
+            stderr: format!(
+                "could not start the detached restore unit: exit status {status}"
+            ),
         });
     }
 
-    // Restore binaries (no-op if file missing inside tar).
-    //
-    // DELIBERATELY LEFT AS `tokio::fs::copy`, WHICH FAILS. Do not "fix" this in
-    // isolation — read the whole comment first.
-    //
-    // `dockpanel-api` and `dockpanel-agent` are running while this executes, so
-    // copying onto them fails ETXTBSY ("Text file busy") and the `?` aborts the
-    // restore here, on the first binary, having changed nothing. That is why
-    // /api/update/rollback has returned a 500 for every call since v2.10.0: this
-    // path has never once completed.
-    //
-    // s229 replaced this with a staged copy + rename(2) (the primitive update.sh
-    // uses, which is unaffected by a busy inode). It worked — and that is the
-    // problem. Getting past the binaries let the restore reach the NEXT stage,
-    // which had also never run: the DB restore below left the schema gutted
-    // (`servers`, `sites`, `metrics_history`, `backup_schedules` all missing)
-    // and the panel unusable. The same dump restores cleanly when run by hand,
-    // so the dump is good and the fault is in how this function applies it —
-    // note that `rollback_to_snapshot` runs this INLINE in the api process even
-    // though its own comment says the restore must be detached so the service
-    // bounce cannot kill it partway.
-    //
-    // So the ETXTBSY failure is currently load-bearing: it is the only thing
-    // keeping a broken restore from destroying a live database. Fix the DB
-    // restore stage FIRST (make it detached, and add ON_ERROR_STOP=1 + a real
-    // exit-status check — psql exits 0 on failed statements), verify a full
-    // restore end to end on a lab box, and only then switch these copies to a
-    // staged rename. See lesson #47: unblocking a path that has never completed
-    // exposes the next untested stage, and that stage can be strictly worse.
-    for bin in &["dockpanel-agent", "dockpanel-api", "dockpanel"] {
-        let src = restore_dir.join("binaries").join(bin);
-        if src.exists() {
-            let dst = format!("/usr/local/bin/{bin}");
-            tokio::fs::copy(&src, &dst).await?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &dst,
-                    std::fs::Permissions::from_mode(0o755),
-                );
-            }
-        }
-    }
-
-    // Restore /etc/dockpanel/ — only files that exist in snapshot.
-    let etc_src = restore_dir.join("etc");
-    if etc_src.exists() {
-        let copy_status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "cp -a {}/. /etc/dockpanel/",
-                shell_escape(&etc_src.to_string_lossy())
-            ))
-            .status()
-            .await?;
-        if !copy_status.success() {
-            tracing::warn!("snapshot restore: copying /etc/dockpanel returned {copy_status}");
-        }
-    }
-
-    // Restore DB — pipe gunzip → psql. Dump was created with --clean
-    // --if-exists so DROP/CREATE statements are inline.
-    let db_dump = restore_dir.join("db").join("dump.sql.gz");
-    if db_dump.exists() {
-        let restore_status = Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "gunzip -c {} | docker exec -i dockpanel-postgres psql -U dockpanel -d dockpanel",
-                shell_escape(&db_dump.to_string_lossy())
-            ))
-            .status()
-            .await?;
-        if !restore_status.success() {
-            let _ = tokio::fs::remove_dir_all(&restore_dir).await;
-            return Err(SnapshotError::Subprocess {
-                cmd: "psql restore".into(),
-                stderr: format!("exit status {restore_status}"),
-            });
-        }
-    }
-
-    let _ = tokio::fs::remove_dir_all(&restore_dir).await;
-
-    // Mark snapshot as used. NB: after rollback the DB is at the snapshot
-    // state — this UPDATE writes to the freshly-restored panel_snapshots
-    // table, which contains this very row (since the snapshot includes
-    // itself). Idempotent.
-    let _ = sqlx::query("UPDATE panel_snapshots SET rolled_back_at = NOW() WHERE id = $1")
-        .bind(snapshot_id)
-        .execute(pool)
-        .await;
-
-    tracing::info!("Restored panel snapshot {snapshot_id}");
+    tracing::info!(
+        "Snapshot restore {snapshot_id} handed to transient unit \
+         dockpanel-snapshot-restore-{snapshot_id}; this process will be stopped by it"
+    );
     Ok(())
+}
+
+/// The verdict written by the last detached restore, if any.
+///
+/// The restore stops and restarts the api, so its outcome cannot be returned
+/// through the request that started it — this file is how the operator finds out
+/// what happened, and it is written on EVERY exit path including aborts.
+pub async fn last_restore_result() -> Option<serde_json::Value> {
+    let raw = tokio::fs::read_to_string(RESTORE_RESULT_PATH).await.ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 /// List snapshots newest-first. Operator-facing read; raw model rows.
@@ -694,6 +692,92 @@ mod tests {
         // 1 byte requirement against any path that exists — should pass.
         let res = check_free_disk("/tmp", 1).await;
         assert!(res.is_ok(), "expected free-disk check to pass: {res:?}");
+    }
+
+    /// The database stage must be atomic and must stop on the first error.
+    ///
+    /// Without both of these, a restore stream that is cut short applies the
+    /// dump's leading DROP block, skips the rest, and exits 0 — measured on a
+    /// lab box as 92 tables reduced to 1 while the caller recorded success.
+    /// With both, the same truncated stream exits non-zero and leaves all 92
+    /// tables intact. This test exists so that neither flag can be dropped
+    /// without a failing build.
+    #[test]
+    fn restore_script_applies_the_database_atomically() {
+        assert!(
+            RESTORE_SCRIPT.contains("ON_ERROR_STOP=1"),
+            "restore script must stop on the first failed statement"
+        );
+        assert!(
+            RESTORE_SCRIPT.contains("--single-transaction"),
+            "restore script must apply the dump in one transaction so a failure changes nothing"
+        );
+    }
+
+    /// The restore must outlive the service it stops. A transient *service* is
+    /// PID1-owned; a scope is created in the caller's context and dies with the
+    /// invoking session, and a plain child dies with the api's control group.
+    #[test]
+    fn restore_script_detaches_via_a_transient_unit() {
+        assert!(RESTORE_SCRIPT.contains("systemd-run"));
+        assert!(
+            !RESTORE_SCRIPT.contains("--scope"),
+            "a scope dies with the caller's session — this must be a transient service"
+        );
+    }
+
+    /// A restore that cannot restore has to say so. `|| true` on a restore step
+    /// is what let the previous rollback path print success while having changed
+    /// nothing, so the script must not silence any of its own failures.
+    #[test]
+    fn restore_script_never_swallows_a_restore_failure() {
+        for (i, line) in RESTORE_SCRIPT.lines().enumerate() {
+            let l = line.trim_start();
+            if l.starts_with('#') {
+                continue;
+            }
+            if l.contains("|| true") {
+                // Only tolerated where failing is genuinely the safe outcome:
+                // best-effort cleanup and the start-services safety net.
+                let tolerated = l.contains("chmod")
+                    || l.contains("rm -rf")
+                    || l.contains("systemctl start")
+                    || l.contains("systemd-cat")
+                    || l.contains("daemon-reload")
+                    || l.contains("systemctl stop")
+                    || l.contains("cp -a /etc/dockpanel")
+                    || l.contains("grep -c");
+                assert!(
+                    tolerated,
+                    "line {} silences a failure in the restore path: {l}",
+                    i + 1
+                );
+            }
+        }
+    }
+
+    /// Every exit path must leave a verdict behind: the restore restarts the
+    /// api, so a result file is the only channel the operator has.
+    #[test]
+    fn restore_script_always_writes_a_result() {
+        assert!(RESTORE_SCRIPT.contains("trap on_exit EXIT INT TERM"));
+        assert!(RESTORE_SCRIPT.contains("write_result"));
+        assert!(RESTORE_SCRIPT.contains(RESTORE_RESULT_PATH));
+    }
+
+    /// Refuse a dump that is already short before anything is destroyed.
+    #[test]
+    fn restore_script_verifies_dump_completeness_before_destroying_anything() {
+        let verify = RESTORE_SCRIPT
+            .find("PostgreSQL database dump complete")
+            .expect("dump completion marker must be checked");
+        let stop = RESTORE_SCRIPT
+            .find("stage=\"stop-services\"")
+            .expect("services must be stopped in a named stage");
+        assert!(
+            verify < stop,
+            "the dump must be proven complete before the panel is taken down"
+        );
     }
 
     #[tokio::test]
