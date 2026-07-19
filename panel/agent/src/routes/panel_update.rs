@@ -528,6 +528,33 @@ mod tests {
         assert!(AGENT_UPDATE_SCRIPT.contains("--collect"));
     }
 
+    /// The rollback branch must not claim it restored anything it did not, and
+    /// must not swallow the failure of a restore — that combination is what made
+    /// `update.sh`'s own rollback print "Rolled back to previous binaries" over
+    /// a box that had not been rolled back at all (lesson #48/#58).
+    #[test]
+    fn the_rollback_branch_never_swallows_or_overclaims_the_restore() {
+        let s = AGENT_UPDATE_SCRIPT;
+        let rb = &s[s.find("stage=\"rollback\"").expect("no rollback branch")..];
+        let rb = &rb[..rb.find("rm -f \"$BACKUP\"").unwrap_or(rb.len())];
+        assert!(
+            !rb.contains(concat!("mv -f \"$BACKUP\" \"$AGENT_BIN\" && ", "systemctl restart dockpanel-agent || true")),
+            "a restore must not be suffixed with a status-swallowing || true"
+        );
+        assert!(
+            rb.contains("if mv -f \"$BACKUP\" \"$AGENT_BIN\""),
+            "the restore's own status has to be branched on"
+        );
+        assert!(
+            rb.contains("COULD NOT RESTORE"),
+            "a failed restore needs to say so, loudly, in the verdict"
+        );
+        assert!(
+            rb.contains("running_version"),
+            "and the claim must be checked against what the agent reports afterwards"
+        );
+    }
+
     /// A run that failed and a run that never happened must be distinguishable
     /// after the restart wipes this process's memory (lesson #52).
     #[test]

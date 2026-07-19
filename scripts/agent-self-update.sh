@@ -86,8 +86,8 @@ chmod 0700 "$STATE_DIR" 2>/dev/null || true
 
 stage="init"
 finished=0
-swapped=0
 from_version=""
+STAGED=""
 
 log() {
     echo "[agent-update] $*"
@@ -122,6 +122,9 @@ WORK=""
 on_exit() {
     local rc=$?
     [ -n "$WORK" ] && rm -rf "$WORK"
+    # A staged binary is 21MB sitting next to the real one; if we died between
+    # staging and installing it, nothing else would ever clean it up.
+    [ -n "${STAGED:-}" ] && [ -e "${STAGED:-}" ] && rm -f "$STAGED"
     if [ "$finished" != "1" ]; then
         write_result false "aborted at stage '$stage' (exit $rc)"
         log "FAILED at stage '$stage' (exit $rc)"
@@ -229,13 +232,30 @@ done
 if [ "$NEW_VERSION" != "$TARGET_CLEAN" ]; then
     stage="rollback"
     log "agent reports '${NEW_VERSION:-nothing}' after the swap, expected $TARGET_CLEAN — rolling back"
+
+    # Never suffix a restore with `|| true` and never claim it worked without
+    # looking (lesson #48, and #58 for doing it anyway). What goes in the result
+    # file is what the agent reports about ITSELF after the attempt, so an
+    # operator can tell "we put you back" from "you are on a binary that does
+    # not start".
+    restored="no backup was taken"
     if [ -f "$BACKUP" ]; then
-        # `mv` again: the new agent may well be running right now.
-        mv -f "$BACKUP" "$AGENT_BIN" && systemctl restart dockpanel-agent || true
-        sleep 3
-        log "restored the previous binary; agent now reports '$(running_version || echo nothing)'"
+        # `mv` again: the new agent may well be running from that path right now.
+        if mv -f "$BACKUP" "$AGENT_BIN"; then
+            systemctl restart dockpanel-agent || log "restart after rollback returned non-zero"
+            sleep 3
+            back="$(running_version || true)"
+            if [ -n "$back" ]; then
+                restored="restored, agent reports $back"
+            else
+                restored="RESTORED THE OLD BINARY BUT THE AGENT IS NOT ANSWERING — this box needs attention"
+            fi
+        else
+            restored="COULD NOT RESTORE $BACKUP — this box is running a binary that did not come up"
+        fi
+        log "$restored"
     fi
-    fail rollback "agent did not come up as $TARGET_CLEAN (saw '${NEW_VERSION:-nothing}'); previous binary restored"
+    fail rollback "agent did not come up as $TARGET_CLEAN (saw '${NEW_VERSION:-nothing}'); $restored"
 fi
 
 rm -f "$BACKUP"

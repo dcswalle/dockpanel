@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.9] - 2026-07-19
+
+### Fixed
+
+- **The agent updater's rollback could say it had restored the previous binary
+  without having restored anything.** If the newly-installed agent failed to
+  come up, the recovery path ran
+  `mv "$BACKUP" "$AGENT_BIN" && systemctl restart … || true` and then recorded
+  `previous binary restored` whatever happened — so a failed restore was
+  indistinguishable from a successful one, on a box that was by definition
+  already in trouble. This is the same shape as the `update.sh` rollback that
+  printed "Rolled back to previous binaries" over a box it had not rolled back
+  (fixed in 2.11.4), reintroduced one release later in the new agent updater.
+
+  The restore's own status is now branched on, and the outcome written to
+  `/var/lib/dockpanel/last-agent-update.json` is what the agent reports about
+  **itself** afterwards — distinguishing "restored, agent reports X" from
+  "could not restore" and from "restored the old binary but the agent is not
+  answering". A test pins the shape, negative-controlled against the exact line
+  that shipped in 2.11.8.
+
+- The agent updater now removes its staged binary if it dies between staging
+  and installing, instead of leaving ~21 MB beside the real one.
+
 ## [2.11.8] - 2026-07-19
 
 ### Fixed
