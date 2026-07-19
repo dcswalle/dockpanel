@@ -17,6 +17,11 @@ Thanks for your interest in contributing! This guide covers development setup, c
 git clone https://github.com/ovexro/dockpanel.git
 cd dockpanel
 
+# Enable the repo's git hooks (secrets scan, version consistency,
+# npm audit + cargo audit). See scripts/hooks/README.md.
+git config core.hooksPath scripts/hooks
+cargo install cargo-audit   # otherwise the Rust half of the audit gate only warns
+
 # Start PostgreSQL
 docker run -d --name dockpanel-postgres \
   -e POSTGRES_USER=dockpanel \
