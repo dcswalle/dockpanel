@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.3] - 2026-07-19
+
+Panel self-update actually works now. Running the v2.11.1 → v2.11.2 upgrade
+through the panel's own flow on a clean box — the fresh-VPS gate that had been
+deferred since the feature shipped — showed it failing at the first download.
+
+### Fixed
+
+- **Panel self-update never completed.** The update poller stores the advertised
+  version with the `v` stripped (`2.11.2`), and `/api/update/apply` validates the
+  operator's target against that stripped form — so `2.11.2` was the only
+  accepted input. It was then handed to `update.sh` verbatim as
+  `DOCKPANEL_VERSION`, which documents `vX.Y.Z` and concatenates it straight into
+  the release download URL. The result was
+  `releases/download/2.11.2/dockpanel-agent-linux-amd64`, which 404s, so every
+  self-update died with curl exit 22 before swapping a single binary. The `v` is
+  now re-added at that boundary. The failure was at least safe — nothing was
+  replaced and the panel stayed on its previous version.
+- **A failed update left the panel reporting "in progress" forever.** The
+  orchestrator only logged the exit status; nothing transitioned the state, so
+  `/api/update/status` sat on `in_flight` until the 15-minute window lapsed, with
+  the real error visible only in the journal. A non-zero exit now logs at error
+  level and finalizes the snapshot, which surfaces through the existing
+  rolled-back state as "attempted `<target>`, still on `<current>`".
+
 ## [2.11.2] - 2026-07-19
 
 Fresh-VPS validation release. Every fix below came out of running the panel

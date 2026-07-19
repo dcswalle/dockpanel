@@ -322,7 +322,14 @@ pub async fn start_panel_update(
     cmd.arg(UPDATE_SCRIPT)
         .env("INSTALL_FROM_RELEASE", "1")
         .env("DOCKPANEL_NO_SELF_REFRESH", "1")
-        .env("DOCKPANEL_VERSION", &target_version)
+        // update.sh documents DOCKPANEL_VERSION as `vX.Y.Z` and concatenates it
+        // straight into the release download URL, but the poller stores the
+        // advertised version with the `v` stripped (telemetry_collector.rs) and
+        // apply_update validates against that stripped form. Passing it through
+        // verbatim built `releases/download/2.11.2/...`, which 404s — so every
+        // self-update died at the first `curl -sfL` with exit 22, before any
+        // binary was swapped. Re-add the prefix at this boundary.
+        .env("DOCKPANEL_VERSION", format!("v{}", target_version.trim_start_matches('v')))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
@@ -335,6 +342,9 @@ pub async fn start_panel_update(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let handle_clone = handle.clone();
+    let handle_for_exit = handle.clone();
+    let pool_for_exit = pool.clone();
+    let snapshot_id_for_exit = meta.id;
     let target_clone = target_version.clone();
     tokio::spawn(async move {
         stream_update_output(handle_clone, stdout, stderr).await;
@@ -345,6 +355,33 @@ pub async fn start_panel_update(
                 tracing::info!(
                     "update.sh (target {target_clone}) exited with status {status}"
                 );
+                // Reaching here at all means update.sh died before it stopped
+                // the api — i.e. it failed early (a bad download, a missing
+                // file), so no binary was swapped and no .bak rollback ran.
+                // Nothing else closes out the row in that case, so the operator
+                // was left staring at `in_flight` until the 15-minute window
+                // lapsed, with the real error only in the journal. Finalising
+                // to_version == from_version is what `current_state` already
+                // reads as "attempted <target>, still on <current>" (RolledBack).
+                if !status.success() {
+                    tracing::error!(
+                        "update.sh (target {target_clone}) FAILED with {status} — \
+                         panel left on the previous version"
+                    );
+                    *handle_for_exit.write().await = UpdateState::Idle;
+                    let current = env!("CARGO_PKG_VERSION");
+                    if let Err(e) = sqlx::query(
+                        "UPDATE panel_snapshots SET to_version = $1 \
+                         WHERE id = $2 AND to_version IS NULL",
+                    )
+                    .bind(current)
+                    .bind(snapshot_id_for_exit)
+                    .execute(&pool_for_exit)
+                    .await
+                    {
+                        tracing::warn!("failed to finalize failed-update snapshot: {e}");
+                    }
+                }
             }
             Ok(Err(e)) => {
                 tracing::warn!("update.sh wait failed: {e}");
