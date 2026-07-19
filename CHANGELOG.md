@@ -6,6 +6,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.11.4] - 2026-07-19
+
+The panel's rollback safety net did not work. v2.11.3 made self-update complete
+for the first time; this release is what happened when the *failure* path was
+finally exercised on a clean box, by deliberately failing an update's health
+check rather than by reading the code.
+
+### Fixed
+
+- **A failed update was never rolled back, and said it was.** `update.sh`'s
+  `rollback()` restored the previous binaries with `cp`. At that point the new
+  `dockpanel-api` and `dockpanel-agent` are already running, and copying onto a
+  running executable fails `ETXTBSY` ("Text file busy") — each restore was
+  suffixed `2>/dev/null || true`, so the failure was discarded and the script
+  printed "Rolled back to previous binaries" while the box kept running the
+  binary that had just failed its health check. Only the `dockpanel` CLI (not
+  running) was actually restored, so the box then disagreed with itself:
+  `dockpanel --version` reported the old version while `/api/health` reported the
+  new one. Rollback now stops the services first and restores with `mv`, the same
+  primitive the forward swap already used, and reports per-binary success or
+  failure instead of discarding it. Verified on a lab box: both binaries return
+  byte-for-byte (sha256-matched) to the pre-update release.
+
+- **A rolled-back update was reported as a successful one.** The snapshot row is
+  finalized by whichever binary boots after the swap — about 30 seconds *before*
+  the health check decides whether that build is any good. On a rollback the new
+  api starts, records "succeeded", then fails its check and is replaced by the
+  old binary; nothing revisits the row. `/api/update/status` now cross-checks the
+  recorded target against the version actually running and reports `rolled_back`
+  when they disagree, so the panel can no longer claim an upgrade it is
+  demonstrably not running.
+
+- **Rolling back across a migration bricked the panel.** Migrations are applied
+  by the new version before the health check; the restored older binary then met
+  an applied migration it had no file for, and sqlx's strict validation failed
+  startup with `VersionMissing`. Because the call site panics, the api exited 101
+  and crash-looped under `Restart=always` until it hit the start limit — a
+  permanent 502 with no operator-facing explanation. Migrations are additive, so
+  an older binary against a newer schema is safe; startup now tolerates unknown
+  applied migrations (missing ones are still applied).
+
+- **Fleet updates handed the wrong version format to remote agents.** The local
+  self-update path was fixed in v2.11.3 to re-add the `v` prefix that release
+  URLs require; the fleet path was missed and passed the operator's input through
+  verbatim, so a bare `2.11.4` became a 404 on every remote node. Fleet targets
+  are by definition servers on older builds, whose on-disk `update.sh` predates
+  the tolerance added in v2.11.3, so nothing downstream rescued it.
+
+### Security
+
+- **Panel snapshots were world-readable.** `/var/backups/dockpanel/snapshots` was
+  `0755` and each tarball `0644`, and every snapshot bundles `/etc/dockpanel` —
+  `api.env` (the JWT signing secret and the Postgres password), `agent.token`,
+  and the agent's TLS private key. Any local user could read them and mint an
+  admin token. The directory is now `0700` and tarballs `0600`, applied to
+  existing snapshots as well as new ones.
+
+### Known issues
+
+- `POST /api/update/rollback` (restore from a panel snapshot) still returns a
+  500 and has never worked. The failure is safe — it aborts before changing
+  anything. Investigation this cycle found that clearing the first fault exposes
+  a worse one behind it: the restore then proceeds to leave the database with
+  missing tables. It is deliberately left failing until the database-restore
+  stage is fixed and verified; see the comment in `panel_snapshot.rs`.
+
 ## [2.11.3] - 2026-07-19
 
 Panel self-update actually works now. Running the v2.11.1 → v2.11.2 upgrade

@@ -238,6 +238,27 @@ pub async fn current_state(handle: &UpdateStateHandle, pool: &PgPool) -> UpdateS
             };
         }
         if to != from {
+            // The row is stamped by whichever binary happened to boot after the
+            // swap — which is ~30s BEFORE update.sh's health check decides
+            // whether the new build is actually good. On a rollback the new api
+            // starts, writes to_version = itself ("succeeded"), and only then
+            // fails its health check and gets replaced by the old binary; the
+            // row is already finalized, so nothing revisits it and the panel
+            // reported a successful update to a version it is demonstrably not
+            // running. Verified on a lab box: state=succeeded to_version=2.11.3
+            // alongside current_version=2.11.2 in the SAME response.
+            //
+            // The running binary is ground truth, so correct the record at the
+            // read site rather than trusting the stamp. No schema change, no new
+            // state variant — this is what `RolledBack` already means.
+            let running = env!("CARGO_PKG_VERSION");
+            if to != running {
+                return UpdateState::RolledBack {
+                    attempted_version: to,
+                    snapshot_id: snap.id,
+                    completed_at: snap.created_at,
+                };
+            }
             return UpdateState::Succeeded {
                 from_version: from,
                 to_version: to,
@@ -819,7 +840,17 @@ async fn update_one_server(
         .await
         .map_err(|e| format!("agent handle: {e}"))?;
 
-    let payload = Some(serde_json::json!({ "target_version": target_version }));
+    // Normalise to the `vX.Y.Z` release-tag spelling at this boundary, exactly
+    // as `start_panel_update` does for the local path. The operator's input is
+    // free text and `validate_target_version` accepts both spellings, so a bare
+    // `2.11.4` reached the remote agent verbatim, became DOCKPANEL_VERSION, and
+    // update.sh concatenated it into `releases/download/2.11.4/...` — a 404 and
+    // `curl -sfL` exit 22 before any swap. The local path was repaired in
+    // v2.11.3; this sibling call site was missed. update.sh's own bare-semver
+    // tolerance does not rescue it, because fleet targets are by definition
+    // servers on OLDER builds whose on-disk update.sh predates that heal.
+    let normalized = format!("v{}", target_version.trim_start_matches('v'));
+    let payload = Some(serde_json::json!({ "target_version": normalized }));
     handle
         .post("/panel/update", payload)
         .await

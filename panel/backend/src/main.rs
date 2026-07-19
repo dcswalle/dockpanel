@@ -133,8 +133,23 @@ async fn main() {
         }
     };
 
-    // Run migrations
+    // Run migrations.
+    //
+    // `ignore_missing(true)` is required because this panel supports ROLLBACK
+    // (W4: update.sh's .bak restore and /api/update/rollback). After an update
+    // applies migration N+1 and is then rolled back, the older binary sees an
+    // applied migration it has no file for; sqlx's default strict validation
+    // rejects that with `VersionMissing(...)`, and since the call site panics,
+    // the restored api exits 101 and crash-loops under Restart=always until it
+    // hits StartLimitBurst and lands in `failed` — a permanent 502 with no
+    // operator-facing explanation. Verified on a lab box: injecting one unknown
+    // `_sqlx_migrations` row is enough to brick startup.
+    //
+    // Migrations here are additive, so an older binary running against a newer
+    // schema is safe; it simply ignores columns it does not know about. Missing
+    // migrations are still applied — only *unknown extra* ones are tolerated.
     sqlx::migrate!("./migrations")
+        .set_ignore_missing(true)
         .run(&db)
         .await
         .expect("Failed to run database migrations");

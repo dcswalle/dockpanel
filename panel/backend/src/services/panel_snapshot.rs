@@ -299,6 +299,15 @@ async fn build_snapshot_inner(
     let size_bytes = tokio::fs::metadata(&tmp_path).await?.len();
     let sha256 = sha256_of(tmp_path).await?;
 
+    // Tighten BEFORE the rename, so the tarball is never observable at the
+    // final path with a permissive mode. It carries api.env (JWT_SECRET, DB
+    // password), agent.token and the agent TLS key — tar created it 0644.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
     // Atomic rename — the tar.gz only becomes "real" once this succeeds.
     tokio::fs::rename(&tmp_path, &final_path).await?;
 
@@ -356,6 +365,34 @@ pub async fn restore_snapshot(pool: &PgPool, snapshot_id: Uuid) -> Result<(), Sn
     }
 
     // Restore binaries (no-op if file missing inside tar).
+    //
+    // DELIBERATELY LEFT AS `tokio::fs::copy`, WHICH FAILS. Do not "fix" this in
+    // isolation — read the whole comment first.
+    //
+    // `dockpanel-api` and `dockpanel-agent` are running while this executes, so
+    // copying onto them fails ETXTBSY ("Text file busy") and the `?` aborts the
+    // restore here, on the first binary, having changed nothing. That is why
+    // /api/update/rollback has returned a 500 for every call since v2.10.0: this
+    // path has never once completed.
+    //
+    // s229 replaced this with a staged copy + rename(2) (the primitive update.sh
+    // uses, which is unaffected by a busy inode). It worked — and that is the
+    // problem. Getting past the binaries let the restore reach the NEXT stage,
+    // which had also never run: the DB restore below left the schema gutted
+    // (`servers`, `sites`, `metrics_history`, `backup_schedules` all missing)
+    // and the panel unusable. The same dump restores cleanly when run by hand,
+    // so the dump is good and the fault is in how this function applies it —
+    // note that `rollback_to_snapshot` runs this INLINE in the api process even
+    // though its own comment says the restore must be detached so the service
+    // bounce cannot kill it partway.
+    //
+    // So the ETXTBSY failure is currently load-bearing: it is the only thing
+    // keeping a broken restore from destroying a live database. Fix the DB
+    // restore stage FIRST (make it detached, and add ON_ERROR_STOP=1 + a real
+    // exit-status check — psql exits 0 on failed statements), verify a full
+    // restore end to end on a lab box, and only then switch these copies to a
+    // staged rename. See lesson #47: unblocking a path that has never completed
+    // exposes the next untested stage, and that stage can be strictly worse.
     for bin in &["dockpanel-agent", "dockpanel-api", "dockpanel"] {
         let src = restore_dir.join("binaries").join(bin);
         if src.exists() {
@@ -503,6 +540,30 @@ async fn ensure_dirs() -> Result<(), SnapshotError> {
     tokio::fs::create_dir_all(STAGING_DIR_PARENT)
         .await
         .map_err(|e| SnapshotError::DirInit(format!("{STAGING_DIR_PARENT}: {e}")))?;
+
+    // A panel snapshot bundles /etc/dockpanel: api.env (JWT_SECRET + the
+    // Postgres password), agent.token, and the agent's TLS private key. The
+    // directories defaulted to 0755 and the tarballs to 0644, so on a box with
+    // any untrusted local user — the normal case for a hosting panel — the
+    // panel's signing secret was world-readable, and anyone who read it could
+    // mint an admin JWT. Lock the directories down here and each tarball at
+    // creation; harden retroactively so boxes that already took snapshots under
+    // the old mode are fixed on the next snapshot rather than staying exposed.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [SNAPSHOT_DIR, STAGING_DIR_PARENT] {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        if let Ok(mut rd) = tokio::fs::read_dir(SNAPSHOT_DIR).await {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "gz") {
+                    let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+    }
     Ok(())
 }
 

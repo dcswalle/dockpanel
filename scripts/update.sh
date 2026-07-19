@@ -564,11 +564,54 @@ log "Services restarted"
 # ── Health check with rollback ────────────────────────────────────────────
 rollback() {
     error "Health check failed, rolling back..."
-    cp "${AGENT_BIN}.bak" "$AGENT_BIN" 2>/dev/null || true
-    cp "${API_BIN}.bak" "$API_BIN" 2>/dev/null || true
-    cp "${CLI_BIN}.bak" "$CLI_BIN" 2>/dev/null || true
+
+    # Restore with `mv`, not `cp`, and stop the services first.
+    #
+    # This path had never executed in production. `cp` writes into the existing
+    # inode, so restoring over the RUNNING dockpanel-api/dockpanel-agent failed
+    # ETXTBSY ("Text file busy") — and because each cp was suffixed
+    # `2>/dev/null || true`, the failure was discarded and the script printed
+    # "Rolled back to previous binaries" while the box kept running the binary
+    # that had just failed its health check. Only the CLI (not running) was
+    # actually restored, so the box then disagreed with itself:
+    # `dockpanel --version` reported the old version while /api/health reported
+    # the new one. rename(2) replaces the directory entry and is unaffected by a
+    # busy inode — it is what the forward swap above already uses.
+    _dockpanel_services_stopped=1
+    systemctl stop dockpanel-agent dockpanel-api 2>/dev/null || true
+
+    local restore_failed=0
+    local pair
+    for pair in "$AGENT_BIN" "$API_BIN" "$CLI_BIN"; do
+        if [ -f "${pair}.bak" ]; then
+            if mv "${pair}.bak" "$pair"; then
+                log "Restored $pair"
+            else
+                error "FAILED to restore $pair from ${pair}.bak"
+                restore_failed=1
+            fi
+        else
+            error "No backup at ${pair}.bak — cannot restore $pair"
+            restore_failed=1
+        fi
+    done
+
+    # Tolerate a non-zero start here rather than letting `set -e` abort the
+    # function before the diagnosis below is printed — the EXIT trap is a safety
+    # net for the process dying, not a substitute for telling the operator what
+    # happened.
     systemctl daemon-reload
-    systemctl restart dockpanel-agent dockpanel-api
+    systemctl start dockpanel-agent || error "dockpanel-agent did not start after rollback"
+    sleep 1
+    systemctl start dockpanel-api || error "dockpanel-api did not start after rollback"
+    _dockpanel_services_stopped=0
+
+    if [ "$restore_failed" = "1" ]; then
+        error "ROLLBACK INCOMPLETE — the panel may still be running the failed build."
+        error "Inspect /usr/local/bin/dockpanel-{api,agent} and restore manually."
+        exit 1
+    fi
+
     warn "Rolled back to previous binaries"
     exit 1
 }
