@@ -6,6 +6,102 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.12.0] - 2026-07-20
+
+### Added
+
+- **Agents can now keep themselves on the panel's release, and it is off until
+  you say otherwise.** Settings → Telemetry → Updates has an **Agent
+  Auto-Update** switch. With it on, every remote agent asks the panel every ~6
+  hours whether it should move, and a box that is behind updates itself using
+  the same checksum-verified, health-verified, rollback-capable updater a fleet
+  rolling update uses. With it off — the default, including on upgrade — the
+  panel answers every agent "nothing to do", so nothing moves unless you start a
+  fleet update yourself.
+
+  Setting the update channel to **Hold** overrides the switch: nothing moves at
+  all. The switch is enforced by the panel rather than by the agent, because an
+  agent only ever learns things by asking — there is no way to push
+  configuration to one.
+
+  This is what closes the gap that made a fleet fix unable to reach existing
+  installs: before this, bringing boxes onto a new agent meant either a fleet
+  run from the panel or re-running `install-agent.sh` on each one.
+
+### Fixed
+
+- **The agent's periodic update check had never once worked, and the way it
+  failed made a broken fleet look like a healthy one.** It failed twice over: it
+  sent no `Authorization` header, and `GET /api/agent/version` required a signed
+  user token — a credential an agent structurally cannot hold, since it has a
+  random token issued at install time. So every check since 2.10.0 was answered
+  `401`.
+
+  What kept it hidden for four releases: the agent parsed the error body as if
+  it were a version answer. An error body is still valid JSON, the `version`
+  field was simply absent, the code fell back to the agent's own version, the
+  two compared equal, and it logged **"Agent is up to date"** — at `debug`
+  level, below the log level agents actually run at. A permanently dead update
+  path was indistinguishable in the journal from a fleet with nothing to do.
+
+  The check now authenticates with the agent's own token, and **inspects the
+  HTTP status before the body**: a non-2xx is a warning that names the status
+  and is never reported as being up to date. Pinned by a test.
+
+- **The check no longer replaces binaries itself.** It used to download the
+  asset, hash it, write a backup that nothing in the codebase ever read back,
+  and rename over its own running executable — with no check that the new agent
+  came up, and so no way back if it did not. It also staged through `/tmp`,
+  which is a cross-device rename (and a hard failure) on any box where `/tmp` is
+  a tmpfs. That work now goes through `scripts/agent-self-update.sh`, the same
+  updater the fleet path uses: digest checked against the release's own
+  `checksums.txt` before anything is installed, atomic swap inside the target
+  directory, the new agent proven to answer `/health` on the expected version,
+  and a real rollback when it does not.
+
+- `GET /api/agent/version` no longer advertises a download URL and checksum read
+  from three settings rows **that nothing in the product ever wrote** — no
+  installer, no migration, no release step, no UI. They were unreadable in
+  practice and, being single values, could never have been correct for a fleet
+  mixing amd64 and arm64 boxes anyway. The endpoint now returns only the target
+  version; each box derives its own asset and digest. The three dead keys are
+  removed from the settings allowlists and deleted on upgrade.
+
+- `/api/agent/version`, `/api/agent/commands` and `/api/agent/commands/result`
+  now share one implementation of agent authentication and one rate limiter
+  (120 req/min per server). The version endpoint previously had neither, under a
+  comment claiming it had both. (`/api/agent/checkin` keeps its own check, which
+  identifies the server from the request body and compares the token in constant
+  time; the route comment now says so rather than implying otherwise.)
+
+- A fleet update to a target that fails **fast** no longer wedges the box at
+  `409 an update is already in flight`. The agent records its verdict with
+  whole-second timestamps while the run's start time is sub-second, and the
+  liveness check compared them directly — so a run that reached its verdict
+  inside the same wall-clock second it began (a mistyped or unreleased target
+  404s in ~0.25s) had its verdict judged to belong to a previous run, leaving
+  the box `InFlight` for ever. This is the exact wedge the v2.11.8 liveness
+  predicate was written to prevent, defeated by the fastest path through it; the
+  comparison is now at whole-second resolution on both sides. (It is also why
+  the two-box fleet test looked intermittent.)
+
+- An agent will no longer retry a version that already failed on it *after*
+  replacing the binary. Because a failed update leaves the agent on its old
+  version, the "am I behind?" test stays true for ever — so a release that
+  installs but does not come up on a particular box would otherwise be
+  downloaded, swapped in, health-checked, rolled back and restarted again on
+  every cycle, indefinitely. The agent now reads its own last verdict, refuses
+  that specific target, and says so in the journal. Failures *before* the swap
+  (a missing release, a checksum mismatch) are cheap and still retried, and an
+  operator-driven fleet update always overrides.
+
+### Notes
+
+- Existing agents are unaffected until you switch this on. Agents older than
+  2.12.0 do not understand the new response and simply carry on doing nothing —
+  they cannot be pushed into a broken update by it. To bring them onto a version
+  that supports this, use a fleet rolling update as before.
+
 ## [2.11.9] - 2026-07-19
 
 ### Fixed

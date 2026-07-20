@@ -154,8 +154,39 @@ export default function Telemetry() {
   const [fleetIncludePanel, setFleetIncludePanel] = useState(false);
   const [fleetSubmitting, setFleetSubmitting] = useState(false);
   const [fleetRuns, setFleetRuns] = useState<FleetRunRow[]>([]);
+  const [agentAutoUpdate, setAgentAutoUpdate] = useState(false);
+  const [savingAgentAutoUpdate, setSavingAgentAutoUpdate] = useState(false);
 
   const limit = 25;
+
+  const loadAgentAutoUpdate = async () => {
+    try {
+      const data = await api.get<Record<string, string>>("/settings");
+      setAgentAutoUpdate(data?.agent_auto_update_enabled === "true");
+    } catch {
+      // Non-fatal: the card renders as off, and the panel is the enforcer
+      // anyway — an agent only updates when this endpoint says so.
+    }
+  };
+
+  const toggleAgentAutoUpdate = async () => {
+    const next = !agentAutoUpdate;
+    setSavingAgentAutoUpdate(true);
+    try {
+      await api.put("/settings", { agent_auto_update_enabled: next ? "true" : "false" });
+      setAgentAutoUpdate(next);
+      flash(
+        next
+          ? "Agents will now update themselves to this panel's release."
+          : "Agent auto-update disabled.",
+        "success"
+      );
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Could not save the setting", "error");
+    } finally {
+      setSavingAgentAutoUpdate(false);
+    }
+  };
 
   const loadUpdateState = async () => {
     try {
@@ -223,6 +254,7 @@ export default function Telemetry() {
       loadUpdateState(),
       loadSnapshots(),
       loadFleetRuns(),
+      loadAgentAutoUpdate(),
     ]).finally(() => setLoading(false));
   }, []);
 
@@ -762,6 +794,46 @@ export default function Telemetry() {
                 "Includes pre-release builds — may break, snapshot rollback is your safety net."}
               {updateState?.channel === "hold" &&
                 "Auto-polling disabled. Use Check Now to manually look for updates."}
+            </div>
+          </div>
+
+          {/* s233: agent auto-update. Off unless switched on here — the panel
+              answers every agent's version query with "nothing to do" until it
+              is, because there is no other way to reach a remote agent. */}
+          <div className="bg-dark-800 border border-dark-600 rounded-lg p-4">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-sm font-medium text-dark-100">Agent Auto-Update</h3>
+                <p className="text-xs text-dark-400 mt-1 max-w-xl">
+                  Remote agents update <span className="text-dark-200">themselves</span> to this
+                  panel&apos;s release (v{config.current_version || updateState?.current_version || "—"}),
+                  unattended, within 6 hours of it changing. Each box verifies the download against
+                  the release checksums, confirms the new agent answers <code>/health</code>, and
+                  rolls back if it does not. Leave this off to update the fleet only when you choose
+                  to, from Fleet Rolling Update below.
+                </p>
+                {(updateState?.channel || "stable") === "hold" && agentAutoUpdate && (
+                  <p className="text-xs text-warn-400 mt-2">
+                    Channel is on Hold — nothing will move until you change it.
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={agentAutoUpdate}
+                aria-label="Agent auto-update"
+                onClick={toggleAgentAutoUpdate}
+                disabled={savingAgentAutoUpdate}
+                className={`shrink-0 relative inline-flex h-6 w-11 items-center rounded-full transition-colors disabled:opacity-50 ${
+                  agentAutoUpdate ? "bg-rust-500" : "bg-dark-600"
+                }`}>
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                    agentAutoUpdate ? "translate-x-6" : "translate-x-1"
+                  }`}
+                />
+              </button>
             </div>
           </div>
 

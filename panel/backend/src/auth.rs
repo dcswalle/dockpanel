@@ -252,3 +252,70 @@ impl FromRequestParts<AppState> for ServerScope {
         }
     }
 }
+
+/// Authenticate an AGENT-originated request from its `servers` row token, and
+/// return the server's id.
+///
+/// This is a different credential from every extractor above: an agent holds a
+/// random hex string issued at install time (`install-agent.sh`), not a signed
+/// user JWT, so `AuthUser` can never accept one. Hash-based lookup first, with a
+/// plaintext fallback for rows predating the hashing migration.
+///
+/// It lives here, as the single implementation, because it used to live in
+/// `routes/agent_commands.rs` while `routes/agent_updates.rs` guarded the very
+/// same class of caller with `AuthUser` — so `/api/agent/version` demanded a JWT
+/// from a caller that structurally cannot hold one and 401'd on every request
+/// for four releases. One copy, used by every agent route (s233).
+pub async fn authenticate_agent(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<Uuid, ApiError> {
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Missing authorization"))?;
+
+    let token_hash = crate::helpers::hash_agent_token(token);
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM servers WHERE agent_token_hash = $1")
+            .bind(&token_hash)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| crate::error::internal_error("unknown", e))?;
+
+    if let Some(r) = row {
+        return Ok(r.0);
+    }
+
+    // Fallback: plaintext lookup for pre-migration rows.
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM servers WHERE agent_token = $1 AND agent_token_hash IS NULL")
+            .bind(token)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| crate::error::internal_error("unknown", e))?;
+
+    row.map(|r| r.0)
+        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Invalid token"))
+}
+
+/// Per-server rate limit shared by the agent routes: 120 requests/minute.
+/// Returns `Err(429)` when exceeded.
+pub fn agent_rate_limit(state: &AppState, server_id: Uuid) -> Result<(), ApiError> {
+    let mut limits = state
+        .agent_rate_limits
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let entry = limits.entry(server_id).or_insert((0, now));
+    if now.duration_since(entry.1).as_secs() >= 60 {
+        *entry = (1, now);
+        return Ok(());
+    }
+    entry.0 += 1;
+    if entry.0 > 120 {
+        return Err(err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
+    }
+    Ok(())
+}

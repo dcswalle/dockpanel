@@ -1,4 +1,3 @@
-use crate::safe_cmd::safe_command;
 use sysinfo::System;
 use std::time::Duration;
 
@@ -282,120 +281,171 @@ async fn execute_command(
     }
 }
 
-/// Check for agent updates every 6 hours. Download new binary, verify checksum, replace, restart.
+/// Ask the panel every 6 hours whether this agent should move, and if so hand
+/// the work to the SAME updater the panel-driven fleet path uses.
+///
+/// This loop used to download and swap the binary itself. It checksummed the
+/// download (fail-closed, to its credit) but then: never verified the new binary
+/// afterwards, wrote a `.bak` that nothing in the tree ever read back, staged
+/// through `/tmp` so the rename was cross-device wherever `/tmp` is a tmpfs, and
+/// restarted itself from inside its own cgroup. `scripts/agent-self-update.sh`
+/// already does every one of those correctly, is checksum-verified against the
+/// release's own `checksums.txt`, health-verifies the result, rolls back when it
+/// does not come up, and is pinned by tests. So the timer goes through it, and
+/// nothing in this file touches a binary any more (s233).
 async fn auto_update_loop(config: PhoneHomeConfig) {
     let client = reqwest::Client::new();
     let version_url = format!("{}/api/agent/version", config.central_url);
     let current_version = env!("CARGO_PKG_VERSION");
 
-    // Wait 1 hour before first check
+    // Wait an hour before the first check, so a box that has just been updated
+    // is not immediately asked to move again.
     tokio::time::sleep(Duration::from_secs(3600)).await;
 
     loop {
-        match check_and_update(&client, &version_url, current_version).await {
-            Ok(true) => {
-                tracing::info!("Agent updated, restarting via systemd...");
-                // Restart self via systemd
-                let _ = safe_command("systemctl")
-                    .args(["restart", "dockpanel-agent"])
-                    .status()
-                    .await;
-                // If systemctl not available, exit and let the service manager restart us
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                std::process::exit(0);
+        match fetch_target(&client, &version_url, &config.server_token).await {
+            Ok(Some(target)) if target.trim_start_matches('v') != current_version => {
+                // A failed update leaves this agent's version unchanged, so the
+                // comparison above stays true for ever. Without this check, a
+                // target that cannot come up on this box would make the timer
+                // repeat the whole destructive sequence — download, swap,
+                // restart, failed health poll, roll back, restart again —
+                // indefinitely and unattended. Worse, the rollback restarts this
+                // process, so the loop would resume at its INITIAL delay rather
+                // than the 6-hour one, repeating roughly hourly on every box in
+                // the fleet. An operator-driven fleet run is not blocked by this;
+                // only the unattended path refuses.
+                if let Some(why) =
+                    crate::routes::panel_update::target_already_failed_destructively(&target)
+                {
+                    tracing::warn!(
+                        "Agent auto-update: NOT retrying {target} — an earlier attempt already \
+                         replaced this binary and had to roll back ({why}). Staying on \
+                         {current_version}. Fix the release, or start a fleet update from the \
+                         panel to override this."
+                    );
+                } else {
+                    tracing::info!(
+                        "Panel target is {target}, running {current_version} — starting self-update"
+                    );
+                    if let Err(e) =
+                        crate::routes::panel_update::start_agent_self_update(&target).await
+                    {
+                        tracing::warn!("Agent self-update did not start: {e}");
+                    }
+                }
             }
-            Ok(false) => {
-                tracing::debug!("Agent is up to date (v{current_version})");
+            Ok(Some(_)) => {
+                tracing::info!("Agent auto-update: already at the panel's target (v{current_version})");
+            }
+            Ok(None) => {
+                tracing::info!("Agent auto-update: not enabled by the panel");
             }
             Err(e) => {
-                tracing::warn!("Auto-update check failed: {e}");
+                tracing::warn!("Agent auto-update check failed: {e}");
             }
         }
 
-        tokio::time::sleep(Duration::from_secs(6 * 3600)).await; // 6 hours
+        // Jitter. Unlike the panel-driven fleet path — which the orchestrator
+        // serialises — every agent runs this timer independently, so a fleet
+        // restarted together would otherwise check in together and then all pull
+        // from GitHub at the same moment.
+        let jitter = rand::random::<u64>() % 1800;
+        tokio::time::sleep(Duration::from_secs(6 * 3600 + jitter)).await;
     }
 }
 
-async fn check_and_update(
+/// Ask the panel what version this agent should be running.
+///
+/// `Ok(None)` means "nothing to do": the panel returns a null target when the
+/// operator has not enabled agent auto-update, or when the update channel is on
+/// hold. That is how the OFF switch reaches a box — an agent is never trusted to
+/// decide for itself that it should update.
+///
+/// **The status check before `.json()` is the entire point of this function.**
+/// It used to be absent, and an error body is still valid JSON: a 401
+/// deserialised cleanly, the missing version field fell back to the running
+/// version, the two compared equal, and the loop reported "up to date" at debug
+/// level — below the unit's own log level. A permanently dead auth path was
+/// therefore indistinguishable in the journal from a healthy fleet, for four
+/// releases (s233).
+async fn fetch_target(
     client: &reqwest::Client,
     version_url: &str,
-    current_version: &str,
-) -> Result<bool, String> {
+    server_token: &str,
+) -> Result<Option<String>, String> {
     let resp = client
         .get(version_url)
+        .header("Authorization", format!("Bearer {server_token}"))
         .timeout(Duration::from_secs(15))
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(body
+        .get("target_version")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
 
-    let latest = body["version"].as_str().unwrap_or(current_version);
-    if latest == current_version {
-        return Ok(false);
-    }
 
-    let download_url = body["download_url"]
-        .as_str()
-        .ok_or("No download URL provided")?;
-    let expected_checksum = body["checksum"].as_str();
+#[cfg(test)]
+mod tests {
+    /// The periodic update check must never swap a binary itself again.
+    ///
+    /// It used to: it downloaded the asset, hashed it, wrote a backup nothing
+    /// ever read, and renamed over its own running executable — with no health
+    /// check afterwards and no rollback. `scripts/agent-self-update.sh` does all
+    /// of that correctly and is pinned by its own tests, so the only thing this
+    /// file may do is ASK the panel and hand a version string to the shared
+    /// launcher.
+    ///
+    /// The forbidden fragments are assembled rather than written out, because
+    /// this test greps its own file (the source-pin prose trap).
+    #[test]
+    fn the_update_check_delegates_the_swap_and_never_performs_one() {
+        let src = include_str!("phone_home.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
-    tracing::info!("New agent version available: {current_version} -> {latest}");
-
-    // Download new binary to temp file with random suffix to prevent symlink attacks
-    let random_suffix: u64 = rand::random();
-    let tmp_path_owned = format!("/tmp/dockpanel-agent-new-{:016x}", random_suffix);
-    let tmp_path = tmp_path_owned.as_str();
-    let resp = client
-        .get(download_url)
-        .timeout(Duration::from_secs(300))
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
-
-    let bytes = resp.bytes().await.map_err(|e| format!("Read failed: {e}"))?;
-
-    // Verify checksum — MANDATORY for supply chain security
-    match expected_checksum {
-        Some(expected) => {
-            use sha2::Digest;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(&bytes);
-            let actual = hex::encode(hasher.finalize());
-            if actual != expected {
-                let _ = tokio::fs::remove_file(tmp_path).await;
-                return Err(format!("Checksum mismatch: expected {expected}, got {actual}"));
-            }
-            tracing::info!("Checksum verified for agent update");
+        for bad in [
+            concat!("std::fs::", "rename"),
+            concat!("current_", "exe()"),
+            concat!("sha2::", "Sha256"),
+            concat!("std::process::", "exit"),
+        ] {
+            assert!(
+                !code.contains(bad),
+                "the update check must not do its own binary swap, found: {bad}"
+            );
         }
-        None => {
-            tracing::error!("Agent update rejected: no checksum provided (supply chain risk)");
-            return Err("Update rejected: server did not provide a checksum".into());
-        }
+
+        // And it must go through the one shared, tested launcher.
+        assert!(
+            code.contains("start_agent_self_update("),
+            "the check must hand the work to the shared launcher"
+        );
+        // The status of the version response has to be inspected before its body
+        // is trusted: an error body is valid JSON, and reading it as a version
+        // answer is what made a dead auth path look like a healthy fleet.
+        assert!(
+            code.contains("if !status.is_success()"),
+            "a non-2xx must never be parsed as a version answer"
+        );
+        // The request must carry the agent's credential.
+        assert!(
+            code.contains("format!(\"Bearer {server_token}\")"),
+            "the version query must authenticate"
+        );
     }
-
-    // Write to temp file
-    tokio::fs::write(tmp_path, &bytes)
-        .await
-        .map_err(|e| format!("Write failed: {e}"))?;
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| format!("chmod failed: {e}"))?;
-    }
-
-    // Backup current binary
-    let current_path = std::env::current_exe().map_err(|e| format!("Can't find self: {e}"))?;
-    let backup_path = format!("{}.bak", current_path.display());
-    let _ = std::fs::copy(&current_path, &backup_path);
-
-    // Replace current binary
-    std::fs::rename(tmp_path, &current_path)
-        .map_err(|e| format!("Replace failed: {e}"))?;
-
-    tracing::info!("Agent binary replaced: {current_version} -> {latest}");
-    Ok(true)
 }

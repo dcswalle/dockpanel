@@ -3,7 +3,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     Json,
 };
-use std::time::Instant;
 use uuid::Uuid;
 
 use crate::error::{internal_error, err, ApiError};
@@ -22,41 +21,14 @@ pub struct AgentCommand {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Helper: extract + verify Bearer token → returns server_id.
-/// Uses hash-based lookup with plaintext fallback for unmigrated rows.
-async fn auth_agent(
-    state: &AppState,
-    headers: &HeaderMap,
-) -> Result<Uuid, ApiError> {
-    let token = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Missing authorization"))?;
-
-    // Try hash-based lookup first
-    let token_hash = crate::helpers::hash_agent_token(token);
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM servers WHERE agent_token_hash = $1")
-            .bind(&token_hash)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("unknown", e))?;
-
-    if let Some(r) = row {
-        return Ok(r.0);
-    }
-
-    // Fallback: plaintext lookup for pre-migration rows
-    let row: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM servers WHERE agent_token = $1 AND agent_token_hash IS NULL")
-            .bind(token)
-            .fetch_optional(&state.db)
-            .await
-            .map_err(|e| internal_error("unknown", e))?;
-
-    row.map(|r| r.0)
-        .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "Invalid token"))
+/// Extract + verify the agent's Bearer token → server_id.
+///
+/// The implementation lives in `crate::auth` so that every agent-authenticated
+/// route shares exactly one copy. It used to live here, privately, which is how
+/// `/api/agent/version` ended up guarding the same class of caller with
+/// `AuthUser` and 401'ing forever (s233).
+async fn auth_agent(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    crate::auth::authenticate_agent(state, headers).await
 }
 
 /// GET /api/agent/commands — Agent polls for pending commands.
@@ -68,19 +40,7 @@ pub async fn poll(
     let server_id = auth_agent(&state, &headers).await?;
 
     // Rate limit: max 120 requests per minute per server_id
-    {
-        let mut limits = state.agent_rate_limits.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let entry = limits.entry(server_id).or_insert((0, now));
-        if now.duration_since(entry.1).as_secs() >= 60 {
-            *entry = (1, now);
-        } else {
-            entry.0 += 1;
-            if entry.0 > 120 {
-                return Err(err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
-            }
-        }
-    }
+    crate::auth::agent_rate_limit(&state, server_id)?;
 
     // Fetch and claim pending commands atomically
     let commands: Vec<AgentCommand> = sqlx::query_as(
@@ -116,19 +76,7 @@ pub async fn report_result(
     let server_id = auth_agent(&state, &headers).await?;
 
     // Rate limit: max 120 requests per minute per server_id
-    {
-        let mut limits = state.agent_rate_limits.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let entry = limits.entry(server_id).or_insert((0, now));
-        if now.duration_since(entry.1).as_secs() >= 60 {
-            *entry = (1, now);
-        } else {
-            entry.0 += 1;
-            if entry.0 > 120 {
-                return Err(err(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
-            }
-        }
-    }
+    crate::auth::agent_rate_limit(&state, server_id)?;
 
     let status = match body.status.as_str() {
         "completed" | "failed" => body.status.as_str(),

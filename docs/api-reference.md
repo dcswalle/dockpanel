@@ -877,4 +877,44 @@ Agent-side (called by the orchestrator over the agent's bearer-auth API):
 | POST   | `/panel/update` | Start the update on the agent host. `{target_version}`. Returns immediately |
 | GET    | `/panel/update/status` | Progress window + failure reason. Reports `running_version`; success is confirmed from `/health`, not from here |
 
+#### Agent auto-update (2.12.0)
+
+Instead of you starting a fleet run, each agent can ask the panel whether it
+should move. This is **off by default**, including on upgrade.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET    | `/api/agent/version` | Agent bearer token (the `servers` row token, **not** a user session) | What version the calling agent should be running |
+
+```json
+{ "target_version": "v2.12.0" }     // move to this
+{ "target_version": null }          // do nothing
+```
+
+`null` is the answer whenever **Settings → Telemetry → Updates → Agent
+Auto-Update** is off, or the update channel is on **Hold**. Hold wins over the
+switch. The decision is made by the panel, not the agent: an agent only ever
+learns things by asking, so the panel is the only place a switch can actually
+take effect.
+
+The target is always **the release the panel itself is running** — an agent is
+never pushed ahead of its panel, and the release that built the panel also built
+that agent asset, so it is guaranteed to exist.
+
+An agent that is behind checks in on its own schedule (first check an hour after
+start, then roughly every 6 hours with jitter so a fleet does not arrive at
+once) and runs the same updater a fleet rolling update runs: the download is
+verified against the release's own `checksums.txt` before anything is installed,
+the swap is atomic within the target directory, and the new agent must answer
+`/health` reporting the expected version or it is rolled back. The outcome is
+written to `/var/lib/dockpanel/last-agent-update.json` on every exit path.
+
+Rate limit: 120 requests/minute per server, as for the other agent endpoints.
+
+**Agents older than 2.12.0 ignore this.** They read a different field, so they
+see nothing to do and carry on — the response deliberately carries no `version`,
+`download_url` or `checksum` key, so an old agent cannot be walked into an
+update it has no working code to perform. Bring them forward with a fleet
+rolling update.
+
 Note: distinct from `/system/updates/*` (OS-package apt-get mgmt).

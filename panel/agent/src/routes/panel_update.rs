@@ -123,17 +123,68 @@ fn validate_target_version(v: &str) -> bool {
     true
 }
 
-/// POST /panel/update — kick off update.sh with the target version.
+/// POST /panel/update — kick off the update with the target version.
 /// Returns 202 with the accepted target. Caller polls /panel/update/status.
+///
+/// A thin HTTP shell over `start_agent_self_update`, which is shared with the
+/// agent's own periodic update check. There is exactly one implementation of
+/// "start an update on this box", so the timer cannot drift into a second,
+/// weaker one — which is precisely what it used to be (s233).
 async fn apply_panel_update(
     Json(body): Json<UpdateRequest>,
 ) -> Result<Json<ApplyResponse>, (axum::http::StatusCode, String)> {
     let target = body.target_version.trim().to_string();
+    match start_agent_self_update(&target).await {
+        Ok(()) => Ok(Json(ApplyResponse {
+            accepted: true,
+            target_version: target,
+        })),
+        Err(e) => Err((e.status_code(), e.to_string())),
+    }
+}
+
+/// Why an update could not be started. The HTTP path maps these to status
+/// codes; the timer path logs them.
+#[derive(Debug)]
+pub(crate) enum StartUpdateError {
+    Invalid(String),
+    InFlight,
+    Internal(String),
+}
+
+impl StartUpdateError {
+    fn status_code(&self) -> axum::http::StatusCode {
+        match self {
+            Self::Invalid(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::InFlight => axum::http::StatusCode::CONFLICT,
+            Self::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+}
+
+impl std::fmt::Display for StartUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(v) => write!(f, "invalid target_version: {v}"),
+            Self::InFlight => write!(f, "an update is already in flight"),
+            Self::Internal(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Start an update of this box to `target`, and return as soon as the work has
+/// been handed to PID1. Never blocks on the update itself and never reports
+/// success — the caller confirms from `/health` and from the updater's own
+/// verdict file.
+///
+/// Shared by the panel-driven fleet path (`POST /panel/update`) and the agent's
+/// own periodic check, so both get the same validation, the same liveness
+/// guard, and the same checksum-verified, health-verified, rollback-capable
+/// updater.
+pub(crate) async fn start_agent_self_update(target: &str) -> Result<(), StartUpdateError> {
+    let target = target.trim().to_string();
     if !validate_target_version(&target) {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            format!("invalid target_version: {target}"),
-        ));
+        return Err(StartUpdateError::Invalid(target));
     }
     // A full panel install keeps the panel updater (it has an API, a frontend
     // and a database to move). Everything else — i.e. every box added with
@@ -153,19 +204,26 @@ async fn apply_panel_update(
     // for the life of the agent and every later attempt — including the one
     // fixing the operator's typo — would be refused 409 for ever. Observed on
     // the s232 lab immediately after the previous fix landed.
-    {
-        let s = STATE.lock().unwrap();
-        if let AgentUpdateState::InFlight { started_at, .. } = &*s {
-            if !run_has_finished(*started_at) {
-                return Err((
-                    axum::http::StatusCode::CONFLICT,
-                    "an update is already in flight".into(),
-                ));
-            }
-        }
-    }
+    //
+    // It also serialises the timer against an operator-driven fleet run: two
+    // updates must never race for the same binary.
+    //
+    // Checking and claiming happen under ONE lock acquisition. They used to be
+    // two, which left a window where two callers could both observe "not in
+    // flight" and both go on to spawn an updater. That was unreachable while the
+    // only caller was HTTP — the orchestrator drives fleet members one at a time
+    // — but s233 added the agent's own timer as a second, independent caller
+    // that can fire at any moment, including the moment an operator starts a
+    // fleet run. Making a dormant race reachable is exactly lesson #50, so the
+    // guard is now atomic: the state may not change between the question and
+    // the claim.
     {
         let mut s = STATE.lock().unwrap();
+        if let AgentUpdateState::InFlight { started_at, .. } = &*s {
+            if !run_has_finished(*started_at) {
+                return Err(StartUpdateError::InFlight);
+            }
+        }
         *s = AgentUpdateState::InFlight {
             target_version: target.clone(),
             started_at: chrono::Utc::now(),
@@ -173,28 +231,23 @@ async fn apply_panel_update(
         };
     }
 
-    // Materialise the embedded updater before returning 202, so a box that
-    // cannot even write it gets a real error instead of a silent no-op.
+    // Materialise the embedded updater before returning, so a box that cannot
+    // even write it gets a real error instead of a silent no-op.
     if matches!(mode, UpdateMode::AgentOnly) {
         if let Err(e) = write_agent_update_script().await {
             let mut s = STATE.lock().unwrap();
             *s = AgentUpdateState::Idle;
-            return Err((
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not stage the agent updater: {e}"),
-            ));
+            return Err(StartUpdateError::Internal(format!(
+                "could not stage the agent updater: {e}"
+            )));
         }
     }
 
-    let target_clone = target.clone();
     tokio::spawn(async move {
-        run_update_subprocess(target_clone, mode).await;
+        run_update_subprocess(target, mode).await;
     });
 
-    Ok(Json(ApplyResponse {
-        accepted: true,
-        target_version: target,
-    }))
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -366,6 +419,48 @@ fn read_agent_update_result() -> Option<serde_json::Value> {
     serde_json::from_str(&raw).ok()
 }
 
+/// Stages `agent-self-update.sh` can only reach once it has ALREADY replaced the
+/// binary. A failure at one of these has cost a download, a swap and two
+/// restarts of this service; a failure before them cost a download at most.
+const POST_SWAP_STAGES: &[&str] = &["swap", "restart", "verify-running", "rollback"];
+
+/// Did a previous run already fail this exact target *after* replacing the
+/// binary? Returns the stage and reason if so.
+///
+/// This exists to stop an unattended retry loop. The agent's timer decides to
+/// update by comparing the panel's target against its own version — and a failed
+/// update leaves its version unchanged, so that comparison stays true for ever.
+/// With a target that cannot come up on this box, the timer would otherwise
+/// re-run the whole destructive sequence indefinitely: download, swap, restart,
+/// fail the health poll, roll back, restart again. And because the rollback
+/// restarts the process, the loop begins again at its *initial* delay rather
+/// than the 6-hour one — so the pathological case would repeat roughly HOURLY,
+/// on every box in the fleet, for ever.
+///
+/// Deliberately NOT consulted by `start_agent_self_update`: an operator starting
+/// a fleet update is making an explicit decision and must be able to override
+/// this. Only the unattended path refuses.
+pub(crate) fn target_already_failed_destructively(target: &str) -> Option<String> {
+    let v = read_agent_update_result()?;
+    if v.get("ok").and_then(|o| o.as_bool()) != Some(false) {
+        return None;
+    }
+    let recorded = v.get("target_version").and_then(|t| t.as_str())?;
+    if recorded.trim_start_matches('v') != target.trim_start_matches('v') {
+        return None;
+    }
+    let stage = v.get("stage").and_then(|s| s.as_str())?;
+    if !POST_SWAP_STAGES.contains(&stage) {
+        return None;
+    }
+    Some(format!(
+        "stage {stage}: {}",
+        v.get("reason")
+            .and_then(|r| r.as_str())
+            .unwrap_or("no reason recorded")
+    ))
+}
+
 /// Has the run that began at `started_at` already reached a verdict?
 ///
 /// This is the one predicate that decides both "may a new update start" and
@@ -374,9 +469,21 @@ fn read_agent_update_result() -> Option<serde_json::Value> {
 /// replaces this process (so the state resets and says nothing), and a failure
 /// inside the transient unit never touches it at all.
 ///
-/// A verdict older than the run's start belongs to a previous run and is
-/// ignored — the comparison is deliberately the conservative direction, since
-/// the verdict's timestamp has whole-second granularity.
+/// A verdict older than the run's start belongs to a previous run and is ignored.
+///
+/// The comparison is at WHOLE-SECOND resolution on both sides, and that is
+/// load-bearing, not sloppy. The verdict's `at` is written by the shell updater
+/// with `date +%S` — whole seconds — while `started_at` is `Utc::now()` with
+/// sub-second precision. Comparing them directly means a run that reaches its
+/// verdict *inside the same wall-clock second it began* has its floored verdict
+/// timestamp fall below `started_at` and be judged stale — so the state stays
+/// `InFlight` for ever and every later attempt is refused `409`. That is the
+/// exact wedge this predicate exists to prevent, and the FASTEST failures hit
+/// it every time: a 404 download resolves in ~0.25s, well within one second, so
+/// a mistyped or unreleased target would reliably wedge the box (measured on the
+/// s233 lab — it is why the fleet regression looked flaky). Flooring
+/// `started_at` to its second makes a verdict written in the same second count
+/// as belonging to this run, which is what "conservative" was reaching for.
 fn run_has_finished(started_at: chrono::DateTime<chrono::Utc>) -> bool {
     let Some(v) = read_agent_update_result() else {
         return false;
@@ -385,7 +492,7 @@ fn run_has_finished(started_at: chrono::DateTime<chrono::Utc>) -> bool {
         return false;
     };
     chrono::DateTime::parse_from_rfc3339(at)
-        .map(|t| t.with_timezone(&chrono::Utc) >= started_at)
+        .map(|t| t.with_timezone(&chrono::Utc).timestamp() >= started_at.timestamp())
         .unwrap_or(false)
 }
 
@@ -630,6 +737,98 @@ mod tests {
         assert!(
             !guard.contains(concat!("if matches!(*s, AgentUpdateState::", "InFlight { .. }) {")),
             "an InFlight state alone is not evidence that an update is still running"
+        );
+    }
+
+    /// The verdict timestamp is whole-second (`date +%S`) but `started_at` is
+    /// sub-second, so `run_has_finished` must compare at second resolution — or
+    /// a run that fails within the same second it began (every 404-fast failure)
+    /// is judged stale and the box wedges at 409 for ever. This pins the
+    /// comparison to `.timestamp()` (whole seconds) on both sides.
+    #[test]
+    fn run_finished_recognises_a_verdict_written_in_the_same_second_as_the_start() {
+        let src = include_str!("panel_update.rs");
+        let f = &src[src.find("fn run_has_finished").unwrap()..];
+        let f = &f[..f.find("\n}").unwrap()];
+        // Negative control: the bare comparison that wedged on sub-second failures.
+        assert!(
+            !f.contains(concat!(".with_timezone(&chrono::Utc) ", ">= started_at)")),
+            "comparing a whole-second verdict against a sub-second start wedges fast failures"
+        );
+        assert!(
+            f.contains(".timestamp() >= started_at.timestamp()"),
+            "the comparison must be at whole-second resolution on both sides"
+        );
+    }
+
+    /// The unattended path must not repeat a destructive update for ever.
+    ///
+    /// A failed update leaves the agent's version unchanged, so the timer's
+    /// "am I behind?" test stays true permanently; without this the box would
+    /// re-download, re-swap, re-fail and roll back on every cycle. Only stages
+    /// reached AFTER the binary was replaced count — a 404 or a checksum
+    /// mismatch costs nothing and should still be retried.
+    #[test]
+    fn a_target_that_already_failed_after_the_swap_is_not_retried_unattended() {
+        for stage in ["swap", "restart", "verify-running", "rollback"] {
+            assert!(
+                POST_SWAP_STAGES.contains(&stage),
+                "{stage} replaces or restores the binary and must count as destructive"
+            );
+        }
+        for stage in ["download", "verify", "arch", "probe", "init"] {
+            assert!(
+                !POST_SWAP_STAGES.contains(&stage),
+                "{stage} happens before the swap and is safe to retry"
+            );
+        }
+        // Every stage the updater can record must be classified, or a new one
+        // silently lands in the retry-for-ever bucket.
+        for line in AGENT_UPDATE_SCRIPT.lines() {
+            let l = line.trim();
+            let Some(rest) = l.strip_prefix("stage=\"") else { continue };
+            let Some(stage) = rest.split('"').next() else { continue };
+            assert!(
+                POST_SWAP_STAGES.contains(&stage) || matches!(stage, "init" | "probe" | "arch" | "download" | "verify" | "complete"),
+                "unclassified updater stage {stage:?} — decide whether it is destructive"
+            );
+        }
+        // And the timer, not the shared launcher, is what consults it: an
+        // operator starting a fleet update must always be able to override.
+        let ph = include_str!("../services/phone_home.rs");
+        assert!(
+            ph.contains("target_already_failed_destructively("),
+            "the unattended path must consult the previous verdict"
+        );
+        let src = include_str!("panel_update.rs");
+        let launcher = &src[src.find("pub(crate) async fn start_agent_self_update").unwrap()
+            ..src.find("async fn run_update_subprocess").unwrap()];
+        assert!(
+            !launcher.contains("target_already_failed_destructively("),
+            "the operator-driven path must NOT be blocked by a previous failure"
+        );
+    }
+
+    /// Two callers may now start an update — the panel over HTTP and the
+    /// agent's own timer — so asking "is one in flight?" and claiming the slot
+    /// must be a single atomic step. Split across two lock acquisitions, both
+    /// callers can observe "no" and both spawn an updater for the same binary.
+    #[test]
+    fn the_in_flight_guard_claims_under_the_same_lock_it_checked() {
+        let src = include_str!("panel_update.rs");
+        let f = &src[src.find("pub(crate) async fn start_agent_self_update").unwrap()..];
+        let f = &f[..f.find("// Materialise the embedded updater").unwrap()];
+
+        let check = f.find("run_has_finished(").expect("no liveness check in the guard");
+        let claim = f
+            .find("*s = AgentUpdateState::InFlight")
+            .expect("the guard never claims the slot");
+        assert!(check < claim, "the guard must check before it claims");
+        // Negative control: the two-acquisition form this shipped with until
+        // s233, where the state could change between the question and the claim.
+        assert!(
+            !f[check..claim].contains("STATE.lock()"),
+            "check and claim must happen under ONE lock acquisition"
         );
     }
 

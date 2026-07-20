@@ -829,7 +829,19 @@ pub fn router() -> Router<AppState> {
         // PHP Extensions Manager
         .route("/api/php/extensions/{version}", get(sites::php_extensions))
         .route("/api/php/extensions/install", post(sites::install_php_extension))
-        // Agent endpoints (no cookie auth — uses Bearer token from servers table)
+        // Agent endpoints — Bearer token from the servers table, never a cookie
+        // or a user JWT. This comment used to say exactly that while
+        // /api/agent/version demanded `AuthUser`, a credential an agent cannot
+        // hold; it 401'd on every request for four releases and the comment is a
+        // large part of why nobody looked (s233). So, precisely:
+        //   /api/agent/version, /api/agent/commands, /api/agent/commands/result
+        //     -> crate::auth::authenticate_agent + agent_rate_limit
+        //   /api/agent/checkin
+        //     -> its OWN check (agent_checkin.rs): the server_id comes from the
+        //        request BODY, the row is fetched by id, and the token is
+        //        compared with subtle::ConstantTimeEq. It also keeps its own
+        //        inlined rate limiter. A change to the shared helper does NOT
+        //        reach it.
         .route("/api/agent/version", get(agent_updates::latest_version))
         .route("/api/agent/checkin", post(agent_checkin::checkin))
         .route("/api/agent/commands", get(agent_commands::poll))
