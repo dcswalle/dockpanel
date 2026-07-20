@@ -30,6 +30,7 @@ pub mod monitors;
 pub mod notifications;
 pub mod on_call;
 pub mod escalation_policies;
+pub mod drift;
 pub mod security;
 pub mod security_scans;
 pub mod server_actions;
@@ -902,6 +903,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/snapshots/{id}", delete(update::delete_snapshot_route))
         .route("/api/update/fleet", get(update::list_fleet_runs).post(update::apply_fleet))
         .route("/api/update/fleet/{id}", get(update::get_fleet_run))
+        // Phase 4 W5: fleet configuration-drift report (read-only)
+        .route("/api/drift/servers", get(drift::servers))
+        .route("/api/drift", get(drift::report))
         // Notification Center
         .route("/api/notifications", get(notifications::list))
         .route("/api/notifications/unread-count", get(notifications::unread_count))

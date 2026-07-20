@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.13.0] - 2026-07-20
+
+Phase 4 W5 — **fleet configuration-drift detection**. A read-only report that
+answers "is my fleet's operational posture consistent?" from one card.
+
+### Added
+
+- **Fleet Configuration Drift report** (Telemetry → Updates → *Fleet
+  Configuration Drift*). Pick a reference server and see, per entity, where every
+  other server in the fleet diverges from it: **alert rules** (monitoring
+  posture), **sites** (inventory asymmetry + per-site config — WAF, SSL, PHP,
+  caches, limits), **cron jobs**, and **backup coverage** (how many sites are
+  unprotected per server). Read-only and computed on demand from the panel's own
+  database — no remote agent call, so even an offline member is comparable, and
+  no background scan. Secret-bearing fields (webhook URLs) are compared by
+  presence only, never by value. New endpoints `GET /api/drift/servers` and
+  `GET /api/drift`. Admin only.
+
+### Notes
+
+- **Report only.** Reconcile (push a source-of-truth server's config to the
+  others) is intentionally not in this release — it is cross-server mutation with
+  no existing transport, and DockPanel keeps that surface explicit and confirmed.
+  Comparing a member's live on-box state against its declared config is a
+  separate later leg.
+
 ## [2.12.1] - 2026-07-20
 
 Ship-path and CI hardening. No behavioural change to the panel or agent — this

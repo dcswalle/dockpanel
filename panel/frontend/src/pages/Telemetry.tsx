@@ -91,6 +91,98 @@ interface FleetRunRow {
   outcome?: string | null;
 }
 
+// Phase 4 W5: fleet configuration drift.
+interface DriftServerOpt {
+  id: string;
+  name: string;
+  is_local: boolean;
+  status: string;
+  last_seen_at: string | null;
+  agent_version: string | null;
+}
+interface FieldDiff {
+  field: string;
+  reference: unknown;
+  current: unknown;
+  sensitive: boolean;
+}
+interface EntityValueDiff {
+  identity: string;
+  fields: FieldDiff[];
+}
+interface CoverageMetrics {
+  total_sites: number;
+  backed_up: number;
+  unprotected: number;
+  destinations: number;
+}
+interface ServerEntityDrift {
+  server_id: string;
+  name: string;
+  status: string;
+  last_seen_at: string | null;
+  in_sync: boolean;
+  note?: string;
+  field_diffs?: FieldDiff[];
+  only_here?: string[];
+  only_reference?: string[];
+  value_diffs?: EntityValueDiff[];
+  coverage?: CoverageMetrics;
+  reference_coverage?: CoverageMetrics;
+}
+interface EntityDrift {
+  entity: string;
+  label: string;
+  mode: string;
+  drift_count: number;
+  servers: ServerEntityDrift[];
+}
+interface DriftReport {
+  reference: { server_id: string; name: string; is_local: boolean; status: string; last_seen_at: string | null };
+  generated_at: string;
+  servers_compared: number;
+  total_drifted_servers: number;
+  entities: EntityDrift[];
+  note?: string;
+}
+
+function fmtDriftVal(v: unknown): string {
+  if (v === null || v === undefined) return "—";
+  if (typeof v === "boolean") return v ? "on" : "off";
+  if (typeof v === "object") return JSON.stringify(v);
+  return String(v);
+}
+
+function FieldDiffTable({ fields }: { fields: FieldDiff[] }) {
+  return (
+    <div className="overflow-x-auto rounded border border-dark-700">
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-dark-500 bg-dark-800/50">
+            <th className="text-left font-normal px-2 py-1">Field</th>
+            <th className="text-left font-normal px-2 py-1">Reference</th>
+            <th className="text-left font-normal px-2 py-1">This server</th>
+          </tr>
+        </thead>
+        <tbody>
+          {fields.map(f => (
+            <tr key={f.field} className="border-t border-dark-700 align-top">
+              <td className="px-2 py-1 font-mono text-dark-300">
+                {f.field}
+                {f.sensitive && (
+                  <span className="text-dark-600 ml-1" title="secret — compared by presence only">🔒</span>
+                )}
+              </td>
+              <td className="px-2 py-1 text-dark-400 break-all">{fmtDriftVal(f.reference)}</td>
+              <td className="px-2 py-1 text-rust-300 break-all">{fmtDriftVal(f.current)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function safeHttpUrl(url: string | undefined): string | null {
   if (!url) return null;
   return /^https:\/\/[a-z0-9.-]+\//i.test(url) ? url : null;
@@ -157,6 +249,13 @@ export default function Telemetry() {
   const [agentAutoUpdate, setAgentAutoUpdate] = useState(false);
   const [savingAgentAutoUpdate, setSavingAgentAutoUpdate] = useState(false);
 
+  // Phase 4 W5: fleet configuration drift.
+  const [driftServers, setDriftServers] = useState<DriftServerOpt[]>([]);
+  const [driftReference, setDriftReference] = useState("");
+  const [driftReport, setDriftReport] = useState<DriftReport | null>(null);
+  const [driftLoading, setDriftLoading] = useState(false);
+  const [driftEntityOpen, setDriftEntityOpen] = useState<string | null>(null);
+
   const limit = 25;
 
   const loadAgentAutoUpdate = async () => {
@@ -212,6 +311,29 @@ export default function Telemetry() {
       // empty
     }
   };
+  const loadDriftServers = async () => {
+    try {
+      const data = await api.get<DriftServerOpt[]>("/drift/servers");
+      setDriftServers(data || []);
+      // Default the reference to the local server (or the first available).
+      setDriftReference(prev => prev || (data?.find(s => s.is_local) || data?.[0])?.id || "");
+    } catch {
+      // empty — the card shows the single-server hint if this never loads
+    }
+  };
+  const runDrift = async () => {
+    if (!driftReference) return;
+    setDriftLoading(true);
+    try {
+      const data = await api.get<DriftReport>(`/drift?reference=${encodeURIComponent(driftReference)}`);
+      setDriftReport(data);
+      setDriftEntityOpen(null);
+    } catch (e: unknown) {
+      flash(e instanceof Error ? e.message : "Could not compute drift", "error");
+    } finally {
+      setDriftLoading(false);
+    }
+  };
 
   const loadEvents = async () => {
     try {
@@ -255,6 +377,7 @@ export default function Telemetry() {
       loadSnapshots(),
       loadFleetRuns(),
       loadAgentAutoUpdate(),
+      loadDriftServers(),
     ]).finally(() => setLoading(false));
   }, []);
 
@@ -1074,6 +1197,142 @@ export default function Telemetry() {
                   })}
                 </div>
               </div>
+            )}
+          </div>
+
+          {/* Phase 4 W5: fleet configuration drift */}
+          <div className="bg-dark-800 border border-dark-600 rounded-lg p-4">
+            <h3 className="text-sm font-medium text-dark-100 mb-1">Fleet Configuration Drift</h3>
+            <div className="text-xs text-dark-400 mb-3">
+              Compare each server's operational posture — alert rules, per-site config, cron jobs and
+              backup coverage — against a reference server. Read-only; computed on demand from the panel.
+            </div>
+
+            {driftServers.length < 2 ? (
+              <div className="text-xs text-dark-400 py-3 text-center">
+                Only one server registered. Add fleet members (Servers page) to detect drift.
+              </div>
+            ) : (
+              <Fragment>
+                <div className="flex flex-wrap items-center gap-2 mb-3">
+                  <label className="text-xs text-dark-400">Reference</label>
+                  <select value={driftReference} onChange={e => setDriftReference(e.target.value)}
+                    className="bg-dark-900 border border-dark-600 text-dark-100 text-xs rounded-lg px-2 py-1.5">
+                    {driftServers.map(s => (
+                      <option key={s.id} value={s.id}>
+                        {s.name}{s.is_local ? " (this panel)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <button onClick={runDrift} disabled={driftLoading || !driftReference}
+                    className="px-3 py-1.5 bg-rust-500 hover:bg-rust-600 text-white rounded-lg text-xs font-medium transition-colors disabled:opacity-50">
+                    {driftLoading ? "Comparing..." : "Compare fleet"}
+                  </button>
+                </div>
+
+                {driftReport && (
+                  <div className="space-y-2">
+                    <div className="text-xs">
+                      {driftReport.note ? (
+                        <span className="text-dark-400">{driftReport.note}</span>
+                      ) : driftReport.total_drifted_servers === 0 ? (
+                        <span className="text-emerald-400">
+                          All {driftReport.servers_compared} server(s) match {driftReport.reference.name}.
+                        </span>
+                      ) : (
+                        <span className="text-rust-300">
+                          {driftReport.total_drifted_servers} of {driftReport.servers_compared} server(s)
+                          {" "}diverge from {driftReport.reference.name}.
+                        </span>
+                      )}
+                    </div>
+
+                    {driftReport.entities.map(ent => {
+                      const open = driftEntityOpen === ent.entity;
+                      return (
+                        <div key={ent.entity} className="bg-dark-900 border border-dark-700 rounded-lg">
+                          <button type="button" onClick={() => setDriftEntityOpen(open ? null : ent.entity)}
+                            className="w-full flex items-center justify-between px-3 py-2 text-left">
+                            <span className="text-xs font-medium text-dark-200">
+                              <span className="text-dark-500 mr-1">{open ? "▾" : "▸"}</span>{ent.label}
+                            </span>
+                            <span className={`text-xs font-medium ${ent.drift_count > 0 ? "text-rust-400" : "text-emerald-400"}`}>
+                              {ent.drift_count > 0 ? `${ent.drift_count} drifted` : "in sync"}
+                            </span>
+                          </button>
+                          {open && (
+                            <div className="px-3 pb-3 space-y-3 border-t border-dark-700 pt-2">
+                              {ent.servers.length === 0 && (
+                                <div className="text-xs text-dark-500">No other servers to compare.</div>
+                              )}
+                              {ent.servers.map(sv => (
+                                <div key={sv.server_id} className="text-xs">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <span className="font-medium text-dark-200">{sv.name}</span>
+                                    <span className={sv.in_sync ? "text-emerald-400" : "text-rust-400"}>
+                                      {sv.in_sync ? "in sync" : "drift"}
+                                    </span>
+                                    {sv.status && sv.status !== "online" && (
+                                      <span className="text-dark-500">({sv.status})</span>
+                                    )}
+                                  </div>
+                                  {sv.note && <div className="text-dark-400 mb-1">{sv.note}</div>}
+
+                                  {sv.field_diffs && sv.field_diffs.length > 0 && (
+                                    <FieldDiffTable fields={sv.field_diffs} />
+                                  )}
+
+                                  {sv.only_reference && sv.only_reference.length > 0 && (
+                                    <div className="mb-1">
+                                      <span className="text-dark-500">Missing here: </span>
+                                      {sv.only_reference.map(id => (
+                                        <span key={id} className="inline-block bg-amber-500/10 text-amber-300 rounded px-1.5 py-0.5 mr-1 mb-1 font-mono break-all">
+                                          {id}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {sv.only_here && sv.only_here.length > 0 && (
+                                    <div className="mb-1">
+                                      <span className="text-dark-500">Only here: </span>
+                                      {sv.only_here.map(id => (
+                                        <span key={id} className="inline-block bg-blue-500/10 text-blue-300 rounded px-1.5 py-0.5 mr-1 mb-1 font-mono break-all">
+                                          {id}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                  {sv.value_diffs && sv.value_diffs.map(vd => (
+                                    <div key={vd.identity} className="mb-2">
+                                      <div className="text-dark-300 font-mono mb-0.5 break-all">{vd.identity}</div>
+                                      <FieldDiffTable fields={vd.fields} />
+                                    </div>
+                                  ))}
+
+                                  {sv.coverage && (
+                                    <div className="flex flex-wrap gap-3 text-dark-300">
+                                      <span>{sv.coverage.backed_up}/{sv.coverage.total_sites} sites backed up</span>
+                                      {sv.coverage.unprotected > 0 && (
+                                        <span className="text-rust-300">{sv.coverage.unprotected} unprotected</span>
+                                      )}
+                                      <span>{sv.coverage.destinations} destination(s)</span>
+                                      {sv.reference_coverage && (
+                                        <span className="text-dark-500">
+                                          reference: {sv.reference_coverage.backed_up}/{sv.reference_coverage.total_sites}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </Fragment>
             )}
           </div>
         </div>

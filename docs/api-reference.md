@@ -918,3 +918,36 @@ update it has no working code to perform. Bring them forward with a fleet
 rolling update.
 
 Note: distinct from `/system/updates/*` (OS-package apt-get mgmt).
+
+## Configuration Drift (v2.13.0, Phase 4 W5)
+
+Read-only report answering "is my fleet's operational posture consistent?".
+Because DockPanel is a single hub DB + thin agents, every server's declared
+config already lives centrally keyed by `server_id`, so this is a **local
+cross-server diff** — no remote agent call, and an offline member is still
+comparable. Computed on demand (no background scan). Admin only.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/drift/servers` | Comparable servers (local first) — reference/target picker source |
+| GET | `/api/drift?reference=<uuid>&targets=<uuid,uuid>` | Drift report against the reference server |
+
+`reference` defaults to the local server; `targets` defaults to every other
+server. Four entities are compared, each in its most meaningful form:
+
+- **alert_rules** — one row per server, whole-row posture diff (the flagship
+  signal: "monitoring is not identical").
+- **sites** — per-domain inventory asymmetry (present on one server, not the
+  other) plus per-site config diffs (`waf_mode`, `ssl_enabled`, `php_version`,
+  caches, limits, …) for domains present on both.
+- **crons** — per `(domain, command)` job parity.
+- **backup_coverage** — per-server summary: how many sites have an enabled
+  backup schedule, how many are unprotected, how many destinations exist.
+
+Secret-bearing fields (`notify_slack_url`, `notify_discord_url`) are compared by
+**presence only** — the report shows `set`/`unset`, never the value.
+
+**Report only.** Reconcile (push a source-of-truth server's config to the
+others) is deliberately not in this release — it is cross-server mutation with no
+existing transport, and DockPanel keeps that surface explicit. Comparing a
+member's live on-box state against its declared config is likewise a later leg.
