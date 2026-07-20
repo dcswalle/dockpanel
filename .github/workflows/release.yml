@@ -156,12 +156,41 @@ jobs:
           echo "Release contents:"
           ls -lh
 
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.1
-        with:
-          cosign-release: 'v2.4.1'
+      - name: Install cosign (pinned v2.4.1, retried + checksum-verified)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # s232: sigstore/cosign-installer's single un-retried fetch got a
+          # connection reset and aborted the WHOLE release job before publish —
+          # the tag existed but no release object did. Install cosign ourselves
+          # with retries + a fail-closed checksum against Sigstore's own published
+          # sums, and make the step non-fatal so a total Sigstore outage ships an
+          # unsigned release instead of losing the publish entirely.
+          COSIGN_VERSION=v2.4.1
+          BASE="https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}"
+          ok=0
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL --retry 3 --retry-delay 5 -o /tmp/cosign "${BASE}/cosign-linux-amd64" \
+               && curl -fsSL --retry 3 --retry-delay 5 -o /tmp/cosign_checksums.txt "${BASE}/cosign_checksums.txt" \
+               && grep ' cosign-linux-amd64$' /tmp/cosign_checksums.txt \
+                    | sed 's#cosign-linux-amd64#/tmp/cosign#' | sha256sum -c -; then
+              ok=1; break
+            fi
+            echo "cosign install attempt ${attempt} failed; retrying in 15s..."
+            rm -f /tmp/cosign /tmp/cosign_checksums.txt
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::warning::cosign install failed after 5 attempts — this release will publish UNSIGNED"
+            echo "⚠️ cosign install failed — this release is UNSIGNED" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          chmod +x /tmp/cosign
+          sudo mv /tmp/cosign /usr/local/bin/cosign
+          cosign version
 
       - name: Sign release assets (keyless via Sigstore)
+        continue-on-error: true
         run: |
           cd release
           for f in $(ls | grep -v '\.sig$' | grep -v '\.pem$'); do

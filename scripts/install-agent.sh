@@ -136,16 +136,9 @@ chmod 600 /etc/dockpanel/agent.env
 echo "[5/7] Downloading agent binary..."
 DOWNLOAD_URL="https://github.com/ovexro/dockpanel/releases/latest/download/dockpanel-agent-linux-${ARCH_LABEL}"
 if ! curl -fsSL "$DOWNLOAD_URL" -o /usr/local/bin/dockpanel-agent; then
-    echo "  Release download failed. Trying panel download..."
-    if [[ -n "$PANEL_URL" ]]; then
-        curl -fsSL "${PANEL_URL}/api/agent/download?arch=${ARCH_LABEL}" -o /usr/local/bin/dockpanel-agent || {
-            echo "Error: Could not download agent binary"
-            exit 1
-        }
-    else
-        echo "Error: Could not download agent binary (no --panel-url provided)"
-        exit 1
-    fi
+    echo "Error: Could not download the agent binary from $DOWNLOAD_URL"
+    echo "  Check connectivity to github.com and that a release asset exists for arch '${ARCH_LABEL}'."
+    exit 1
 fi
 chmod +x /usr/local/bin/dockpanel-agent
 

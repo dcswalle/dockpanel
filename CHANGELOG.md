@@ -6,6 +6,54 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.12.1] - 2026-07-20
+
+Ship-path and CI hardening. No behavioural change to the panel or agent — this
+release makes the machinery that builds, publishes, and installs DockPanel fail
+loudly and verify what it downloads.
+
+### Security
+
+- **The panel updater now verifies every release asset it downloads.**
+  `scripts/update.sh` fetches the release's `checksums.txt` and checks the
+  sha256 of the agent, API, CLI, and frontend before installing any of them —
+  failing closed if the checksums file is missing, has no entry, or disagrees.
+  This is the guarantee the agent self-updater already gave; it closes the
+  parity gap where the panel path installed unverified bytes.
+
+- **CI security audits are now enforcing.** The Security Audit job dropped the
+  `|| true` that made `cargo audit` (×3) and `npm audit` (×3) unable to fail,
+  and it now also audits `website/server`. A real advisory fails the build
+  instead of scrolling past green. (The pre-push hook has enforced this locally
+  since 2.11.1; CI now agrees.)
+
+### Fixed
+
+- **A Sigstore outage can no longer lose an entire release.** At 2.11.8 the
+  release job died fetching the cosign installer — every binary built and the
+  tag existed, but no GitHub Release was ever published. The cosign install is
+  now retried, checksum-verified against Sigstore's own published sums, and
+  non-fatal: if signing is unreachable the release still publishes (unsigned,
+  and it says so in the run summary) rather than being lost.
+
+- **`update.sh` no longer aborts before installing binaries on non-git
+  layouts.** On a hand-built `/opt/dockpanel` with no repo tree, copying the
+  canonical systemd unit failed under `set -euo pipefail` and stopped the whole
+  update before the binary swap. It now keeps the existing on-disk unit and
+  continues.
+
+- **The agent installer no longer references a panel download route that does
+  not exist.** `install-agent.sh`'s fallback hit `/api/agent/download`, which
+  was never implemented, so it only stacked a confusing error on top of a real
+  one. Removed, with an honest message pointing at the actual cause.
+
+### Added
+
+- **The release smoke-test now exec-proves the arm64 binaries.** Every release
+  already verified the amd64 assets are static and load cleanly across the
+  distro matrix (#70); the published `linux-arm64` assets are now run under QEMU
+  emulation to prove they reach `main()` too.
+
 ## [2.12.0] - 2026-07-20
 
 ### Added

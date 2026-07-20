@@ -2,7 +2,8 @@
 //!
 //! Lifts `scripts/update.sh`'s SSH-only flow into a panel-UI-driven action.
 //! Does NOT reimplement the binary swap or rollback — those live in
-//! `update.sh:430-499` and are battle-tested. The orchestrator's job is:
+//! `update.sh` (its binary-swap + `.bak` rollback path) and are battle-tested.
+//! The orchestrator's job is:
 //!
 //!   1. Create a persistent snapshot via [`super::panel_snapshot`].
 //!   2. Shell out to `update.sh` with `DOCKPANEL_NO_SELF_REFRESH=1` +

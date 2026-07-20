@@ -63,9 +63,6 @@ jobs:
       - name: Type check
         run: cd panel/frontend && npx tsc --noEmit
 
-      - name: Audit
-        run: cd panel/frontend && npm audit --audit-level=high || true
-
   build-rust:
     name: Build (Rust)
     runs-on: ubuntu-latest
@@ -169,16 +166,23 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked 2>/dev/null || true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
+      # Audits are ENFORCING (no `|| true`): a real advisory now FAILS the build.
+      # Accepted, upstream-blocked items are ignored narrowly and on purpose —
+      # panel/backend/.cargo/audit.toml pins RUSTSEC-2023-0071 (the rsa phantom
+      # lockfile entry from sqlx-mysql; DockPanel is Postgres-only). Unmaintained
+      # and yanked advisories are cargo-audit *warnings* and do not fail the run.
       - name: Audit Agent
-        run: cd panel/agent && cargo audit || true
+        run: cd panel/agent && cargo audit
 
       - name: Audit Backend
-        run: cd panel/backend && cargo audit || true
+        run: cd panel/backend && cargo audit
 
       - name: Audit CLI
-        run: cd panel/cli && cargo audit || true
+        run: cd panel/cli && cargo audit
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -186,7 +190,10 @@ jobs:
           node-version: '20'
 
       - name: Audit Frontend
-        run: cd panel/frontend && npm ci && npm audit --audit-level=high || true
+        run: cd panel/frontend && npm ci && npm audit --audit-level=high
 
-      - name: Audit Marketing Site
-        run: cd website/client && npm ci && npm audit --audit-level=high || true
+      - name: Audit Marketing Site (client)
+        run: cd website/client && npm ci && npm audit --audit-level=high
+
+      - name: Audit Marketing Site (server)
+        run: cd website/server && npm ci && npm audit --audit-level=high

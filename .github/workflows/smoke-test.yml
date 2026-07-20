@@ -142,3 +142,68 @@ jobs:
             fail=1
           fi
           exit $fail
+
+  # arm64 ABI/loader guard (#70 extended to aarch64). The published
+  # dockpanel-*-linux-arm64 assets come from the same musl target but were never
+  # exec-proven. Runs on the host (NOT in a container) so docker/setup-qemu-action
+  # can register arm64 binfmt, then execs the arm64 binaries under QEMU emulation.
+  # One arm64 env is sufficient: static musl has zero distro-specific libc deps.
+  smoke-arm64:
+    needs: resolve
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Set up QEMU (arm64 emulation via binfmt)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Download published binaries (arm64)
+        run: |
+          set -eux
+          TAG='${{ needs.resolve.outputs.tag }}'
+          BASE="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+          for b in agent api cli; do
+            curl -fsSL "${BASE}/dockpanel-${b}-linux-arm64" -o "dockpanel-${b}"
+            chmod +x "dockpanel-${b}"
+          done
+
+      - name: Assert static linkage (primary #70 guard, arm64)
+        run: |
+          set -eux
+          for b in agent api cli; do
+            file "dockpanel-${b}"
+            if ! file "dockpanel-${b}" | grep -q "statically linked"; then
+              echo "FAIL: dockpanel-${b} (arm64) is NOT statically linked — would reintroduce the #70 glibc break."
+              exit 1
+            fi
+          done
+
+      - name: Exec probe under arm64 emulation (loader must accept the binaries)
+        run: |
+          # Only the tiny --version path is emulated; the arm64 binaries run in a
+          # real aarch64 userland (debian:12 arm64) via QEMU binfmt. Static musl =
+          # no distro-specific libs, so one arm64 env is sufficient. Generous
+          # timeout because user-mode emulation adds overhead. Same neutralised
+          # exit handling as the amd64 job: a benign non-zero (api/agent panic on
+          # missing env) is NOT a #70 failure — only a real loader/ABI error is.
+          set +e +o pipefail
+          fail=0
+          run_arm64() { docker run --rm --platform linux/arm64 -v "$PWD:/w" -w /w debian:12 "$@"; }
+          for b in cli api agent; do
+            out="$(run_arm64 timeout 30 ./dockpanel-$b --version 2>&1)"; rc=$?
+            echo "--- dockpanel-$b (arm64, rc=$rc) ---"
+            printf '%s\n' "$out" | head -4
+            if printf '%s' "$out" | grep -qiE "GLIBC_|not a dynamic executable|cannot execute binary|Exec format error"; then
+              echo "FAIL: loader/ABI error for dockpanel-$b (arm64) — the #70 break."
+              fail=1
+            fi
+          done
+          # Positive proof the arm64 CLI reaches main(): --version prints and exits 0.
+          if ! run_arm64 ./dockpanel-cli --version | grep -qi dockpanel; then
+            echo "FAIL: dockpanel-cli --version (arm64) did not print a version"
+            fail=1
+          fi
+          exit $fail

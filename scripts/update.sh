@@ -230,25 +230,57 @@ if [ "$INSTALL_FROM_RELEASE" = "1" ]; then
     fi
     BASE_URL="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}"
 
+    # Verify every downloaded asset against the release's checksums.txt before
+    # installing it — parity with scripts/agent-self-update.sh. The release ships
+    # checksums.txt (.github/workflows/release.yml: `sha256sum dockpanel-* >
+    # checksums.txt`; entries are bare basenames). Fail closed: a missing
+    # checksums.txt, a missing entry, or a hash mismatch aborts the upgrade —
+    # never install unverified bytes (lesson #25/#48).
+    CHECKSUMS=/tmp/dockpanel-checksums.txt
+    if ! curl -sfL "${BASE_URL}/checksums.txt" -o "$CHECKSUMS"; then
+        error "Could not download ${BASE_URL}/checksums.txt — refusing to install unverified binaries"
+        exit 1
+    fi
+    verify_checksum() {
+        # $1 = downloaded file, $2 = asset name as it appears in checksums.txt
+        local file="$1" asset="$2" expect actual
+        expect=$(awk -v a="$asset" '$2 == a {print $1}' "$CHECKSUMS" | head -1)
+        if [ -z "$expect" ]; then
+            error "checksums.txt for $RELEASE_TAG has no entry for $asset — refusing to install"
+            exit 1
+        fi
+        actual=$(sha256sum "$file" | awk '{print $1}')
+        if [ "$actual" != "$expect" ]; then
+            error "sha256 mismatch for $asset: got $actual, expected $expect — refusing to install"
+            exit 1
+        fi
+        log "Verified $asset (sha256)"
+    }
+
     log "Downloading agent (${DL_ARCH})..."
     curl -sfL "${BASE_URL}/dockpanel-agent-linux-${DL_ARCH}" -o /tmp/dockpanel-agent-new
+    verify_checksum /tmp/dockpanel-agent-new "dockpanel-agent-linux-${DL_ARCH}"
     chmod +x /tmp/dockpanel-agent-new
 
     log "Downloading API (${DL_ARCH})..."
     curl -sfL "${BASE_URL}/dockpanel-api-linux-${DL_ARCH}" -o /tmp/dockpanel-api-new
+    verify_checksum /tmp/dockpanel-api-new "dockpanel-api-linux-${DL_ARCH}"
     chmod +x /tmp/dockpanel-api-new
 
     log "Downloading CLI (${DL_ARCH})..."
     curl -sfL "${BASE_URL}/dockpanel-cli-linux-${DL_ARCH}" -o /tmp/dockpanel-cli-new
+    verify_checksum /tmp/dockpanel-cli-new "dockpanel-cli-linux-${DL_ARCH}"
     chmod +x /tmp/dockpanel-cli-new
 
     # Download and extract frontend
     log "Downloading frontend..."
     curl -sfL "${BASE_URL}/dockpanel-frontend.tar.gz" -o /tmp/dockpanel-frontend.tar.gz
+    verify_checksum /tmp/dockpanel-frontend.tar.gz "dockpanel-frontend.tar.gz"
     FE_DIR="/opt/dockpanel/frontend"
     mkdir -p "$FE_DIR"
     tar xzf /tmp/dockpanel-frontend.tar.gz -C "$FE_DIR"
     rm -f /tmp/dockpanel-frontend.tar.gz
+    rm -f "$CHECKSUMS"
     log "Frontend updated"
 else
     # Build from source
@@ -326,8 +358,12 @@ fi
 log "Updating systemd service files..."
 # Agent unit — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
 # v2.8.13: existing installs upgrading from v2.8.12 or earlier get the strict sandbox here.
-cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
-chmod 644 /etc/systemd/system/dockpanel-agent.service
+if [ -f "$AGENT_SRC/dockpanel-agent.service" ]; then
+    cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
+    chmod 644 /etc/systemd/system/dockpanel-agent.service
+else
+    warn "Agent unit source not found at $AGENT_SRC/dockpanel-agent.service — keeping existing on-disk unit (no repo tree on this layout)"
+fi
 
 cat > /etc/systemd/system/dockpanel-api.service << 'EOF'
 [Unit]
