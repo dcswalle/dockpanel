@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.14.0] - 2026-07-21
+
+Docker Apps hardening — a security, correctness, and safety pass over the Docker
+app-management surface (an s237 audit-coverage rotation; the largest and
+never-before behaviorally-audited surface). Fixes a routine "change image"
+operation that silently stripped a container's isolation, networking, and panel
+management; removes an over-broad capability from GPU containers; makes deploy
+resource limits actually apply; and adds confirmations/feedback to three
+destructive or silent UI actions.
+
+### Security
+
+- **GPU containers no longer receive `CAP_SYS_ADMIN`.** Deploying a template with
+  GPU passthrough enabled added `SYS_ADMIN` on top of the otherwise `cap_drop ALL`
+  hardened container — a near-root capability that enables container→host escape
+  (`mount(2)` / cgroup `release_agent`) and reverses the sandbox. GPU compute via
+  the NVIDIA Container Toolkit does not require it, so the capability has been
+  removed; GPU containers now keep the same minimal cap set as every other
+  template.
+
+### Fixed
+
+- **"Change image" no longer downgrades a container's security or breaks its
+  reverse proxy.** The operation recreated the container with a bare `docker run`
+  that dropped every hardening flag — `cap_drop ALL` + the minimal cap allowlist,
+  `no-new-privileges`, the `127.0.0.1:<port>` publish (so the nginx reverse proxy
+  returned 502), the restart policy, the memory/CPU limits, the environment
+  variables, and the `dockpanel.managed` labels (so the container disappeared from
+  the panel and became unmanageable). It now inspects the existing container and
+  recreates it preserving all of that, only swapping the image.
+- **Deploy-time CPU limits above one core now apply.** A deploy requesting
+  `cpu_percent > 100` (more than one core) silently received no CPU limit at all,
+  so the container ran with unlimited CPU. The deploy path now applies the limit
+  for any positive value, matching the live "update limits" path (1–10000%).
+- **Deploy resource requests are always bounded.** Memory/CPU limits were only
+  validated when the operator had configured a per-user container policy, so a
+  default operator's deploy was unbounded. Deploy now clamps `memory_mb` to
+  4–65536 and `cpu_percent` to 1–10000 unconditionally (a per-user policy remains
+  an additional, tighter ceiling), and the memory→bytes conversion is
+  overflow-safe.
+- **Deleting an Ollama model now reports failures.** A failed model deletion was
+  swallowed silently (the model stayed listed with no error); the failure is now
+  surfaced.
+
+### Changed
+
+- **Destructive Docker-app actions now require confirmation.** "Prune Unused
+  Images" (removes all unused images host-wide, irreversibly), "Remove" on a
+  Compose stack (tears down every container in the stack), and "Remove" on an
+  Ollama model (a multi-GB delete) now use the same two-step Confirm/Cancel
+  already used for removing a single app.
+
 ## [2.13.1] - 2026-07-21
 
 Mail-surface hardening — a security and correctness pass over the mail-server

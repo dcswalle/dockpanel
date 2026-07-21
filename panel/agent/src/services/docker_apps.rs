@@ -2506,17 +2506,23 @@ pub async fn deploy_app(
     // Docker resource limits
     if let Some(mem) = memory_mb {
         if mem > 0 {
-            host_config.memory = Some((mem * 1024 * 1024) as i64);
+            // saturating_mul avoids a u64 overflow wrapping to a garbage/negative i64 limit
+            // for an absurd memory_mb; the backend also clamps to 4..=65536 (s237 audit).
+            let bytes = mem.saturating_mul(1024 * 1024).min(i64::MAX as u64) as i64;
+            let swap = mem.saturating_mul(2 * 1024 * 1024).min(i64::MAX as u64) as i64;
+            host_config.memory = Some(bytes);
             // Memory swap = 2x memory (allows some swap)
-            host_config.memory_swap = Some((mem * 2 * 1024 * 1024) as i64);
+            host_config.memory_swap = Some(swap);
         }
     }
     if let Some(cpu) = cpu_percent {
-        if cpu > 0 && cpu <= 100 {
-            // CPU quota: period * (percent/100)
-            // Default period is 100000 (100ms)
+        if cpu > 0 {
+            // cpu_percent is % of ONE core (100 = 1.0 core); values > 100 request multiple
+            // cores, so cpu_quota may exceed cpu_period. The previous `cpu <= 100` bound
+            // silently dropped the limit for any multi-core request → the container ran with
+            // UNLIMITED CPU (s237 audit — parity with update_limits which accepts 1..=10000).
             host_config.cpu_period = Some(100_000);
-            host_config.cpu_quota = Some((cpu * 1000) as i64);
+            host_config.cpu_quota = Some(cpu.saturating_mul(1000).min(i64::MAX as u64) as i64);
         }
     }
 
@@ -2542,10 +2548,11 @@ pub async fn deploy_app(
                 ..Default::default()
             }
         ]);
-        // GPU containers may need additional caps
-        if let Some(ref mut caps) = host_config.cap_add {
-            caps.push("SYS_ADMIN".to_string());
-        }
+        // NOTE (s237 audit): GPU compute via the NVIDIA Container Toolkit does NOT need
+        // CAP_SYS_ADMIN — the device_requests above grant GPU access. Granting SYS_ADMIN would
+        // reverse the cap_drop ALL hardening (it enables mount(2)/cgroup container→host escape),
+        // so it is deliberately NOT added; the container keeps the same minimal cap set as any
+        // other template. A workload that genuinely needs it should be an explicit opt-in.
         tracing::info!("GPU passthrough enabled for container {container_name}: {log_target}");
     }
 
@@ -3237,6 +3244,109 @@ pub async fn update_app(container_id: &str) -> Result<UpdateResult, String> {
         container_id: container.id,
         blue_green: false,
     })
+}
+
+/// Change a managed container's image, preserving its full runtime configuration.
+///
+/// (s237 audit) The previous implementation recreated the container with a bare
+/// `docker run -d --name X --volumes-from Y --network bridge <image>`, which dropped
+/// EVERY hardening flag the original deploy applied — cap_drop ALL + the minimal cap_add
+/// allowlist, security_opt no-new-privileges, the published `127.0.0.1:<port>` binding
+/// (so the nginx reverse proxy 502'd), the restart policy, the memory/CPU limits, the env
+/// vars, and the `dockpanel.managed` labels (so the container vanished from the panel).
+/// This inspects the existing container and recreates it with the same `host_config`
+/// (caps, security_opt, port bindings, restart, resource limits, GPU device requests, binds),
+/// `labels`, `env`, and `exposed_ports`, only swapping the image. The new image's own
+/// cmd/entrypoint apply (a tag bump may change them), matching the original run semantics.
+pub async fn change_container_image(container_id: &str, new_image: &str) -> Result<String, String> {
+    let docker =
+        Docker::connect_with_local_defaults().map_err(|e| format!("Docker connect failed: {e}"))?;
+
+    // Inspect the existing container to capture its full config before touching it.
+    let info = docker
+        .inspect_container(container_id, None)
+        .await
+        .map_err(|e| format!("Failed to inspect container: {e}"))?;
+
+    let config = info.config.ok_or("No container config found")?;
+    let host_config = info.host_config.ok_or("No host config found")?;
+    let name = info
+        .name
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_string();
+    if name.is_empty() {
+        return Err("Container not found".to_string());
+    }
+
+    // Pull the new image. create_image's stream may emit non-fatal warnings, so verify the
+    // image exists locally afterwards rather than trusting the stream's per-chunk results.
+    let mut pull = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: new_image,
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    let mut last_err: Option<String> = None;
+    while let Some(result) = pull.next().await {
+        if let Err(e) = result {
+            last_err = Some(e.to_string());
+        }
+    }
+    if docker.inspect_image(new_image).await.is_err() {
+        return Err(format!(
+            "Failed to pull image '{new_image}': {}",
+            last_err.unwrap_or_else(|| "image not found after pull".to_string())
+        ));
+    }
+
+    // Stop + remove the old container, KEEPING its volumes (v: false) so data persists.
+    docker
+        .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+        .await
+        .ok();
+    docker
+        .remove_container(
+            container_id,
+            Some(RemoveContainerOptions {
+                v: false,
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| format!("Failed to remove old container: {e}"))?;
+
+    // Recreate with the SAME hardening/networking/limits/labels/env, only the image changes.
+    let new_config = Config {
+        image: Some(new_image.to_string()),
+        env: config.env,
+        exposed_ports: config.exposed_ports,
+        labels: config.labels,
+        host_config: Some(host_config),
+        ..Default::default()
+    };
+
+    let container = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: name.as_str(),
+                platform: None,
+            }),
+            new_config,
+        )
+        .await
+        .map_err(|e| format!("Failed to create container with new image: {e}"))?;
+
+    docker
+        .start_container(&container.id, None::<StartContainerOptions<String>>)
+        .await
+        .map_err(|e| format!("Failed to start container with new image: {e}"))?;
+
+    tracing::info!("Image changed for {name}: → {new_image} (new: {})", container.id);
+    Ok(container.id)
 }
 
 /// Get environment variables from a running container.

@@ -82,6 +82,22 @@ pub async fn deploy(
         }
     }
 
+    // ── Unconditional resource clamp (s237 audit) ──
+    // Mirrors update_limits (L780-797) so a deploy is bounded even when the operator has no
+    // container_policies row. Without this, the agent applies memory only for mem>0 and CPU
+    // (post-s237) for any cpu>0 with no upper bound, so an unclamped request could exhaust the
+    // host. The per-user policy below is an ADDITIONAL, tighter ceiling on top of these bounds.
+    if let Some(mem) = body.memory_mb {
+        if mem < 4 || mem > 65536 {
+            return Err(err(StatusCode::BAD_REQUEST, "memory_mb must be between 4 and 65536"));
+        }
+    }
+    if let Some(cpu) = body.cpu_percent {
+        if cpu == 0 || cpu > 10000 {
+            return Err(err(StatusCode::BAD_REQUEST, "cpu_percent must be between 1 and 10000"));
+        }
+    }
+
     // ── Container policy enforcement ──
     let policy: Option<(i32, i64, i32, Option<String>)> = sqlx::query_as(
         "SELECT max_containers, max_memory_mb, max_cpu_percent, allowed_images FROM container_policies WHERE user_id = $1"

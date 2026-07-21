@@ -1216,7 +1216,9 @@ fn is_valid_image_ref(image: &str) -> bool {
 }
 
 /// POST /apps/{container_id}/change-image — Change a container's image tag.
-/// Pulls the new image, stops the old container, starts a new one preserving volumes/env/ports/name.
+/// Recreates the container with the new image while PRESERVING its full runtime config
+/// (caps, security_opt, port bindings, restart, resource limits, GPU, labels, env, volumes)
+/// via `docker_apps::change_container_image` — see that fn for the s237 rationale.
 async fn change_image(
     Path(container_id): Path<String>,
     Json(body): Json<serde_json::Value>,
@@ -1234,127 +1236,15 @@ async fn change_image(
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid image reference: must be <= 256 chars, alphanumeric with / : . - _ @ only, and not start with -"}))));
     }
 
-    // 1. Pull new image
-    let pull_output = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        safe_command("docker")
-            .args(["pull", &image])
-            .output(),
-    ).await
-        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "Image pull timed out"}))))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Pull failed: {e}")}))))?;
+    let new_id = docker_apps::change_container_image(&container_id, &image)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
 
-    if !pull_output.status.success() {
-        let stderr = String::from_utf8_lossy(&pull_output.stderr);
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Failed to pull image: {stderr}")}))));
-    }
-    tracing::info!("Pulled image: {image}");
-
-    // 2. Get current container info (name, volumes, env, ports)
-    let inspect_output = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        safe_command("docker")
-            .args(["inspect", "--format", "{{.Name}}", &container_id])
-            .output(),
-    ).await
-        .map_err(|_| (StatusCode::GATEWAY_TIMEOUT, Json(serde_json::json!({"error": "Inspect timed out"}))))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-
-    let container_name = String::from_utf8_lossy(&inspect_output.stdout)
-        .trim()
-        .trim_start_matches('/')
-        .to_string();
-
-    if container_name.is_empty() {
-        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Container not found"}))));
-    }
-
-    // 3. Stop old container, rename it, create new one with same name
-    let backup_name = format!("{container_name}-old-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-
-    // Stop
-    if let Err(e) = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        safe_command("docker")
-            .args(["stop", &container_id])
-            .output(),
-    ).await
-        .map_err(|e| e.to_string())
-        .and_then(|r| r.map_err(|e| e.to_string()))
-        .map(|_| ())
-    {
-        tracing::warn!("change_image: failed to stop container {container_id}: {e}");
-    }
-
-    // Rename old container
-    safe_command("docker")
-        .args(["rename", &container_id, &backup_name])
-        .output().await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("Rename failed: {e}")}))))?;
-
-    // 4. Create new container using `docker run` with --volumes-from to preserve data
-    let run_output = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        safe_command("docker")
-            .args([
-                "run", "-d",
-                "--name", &container_name,
-                "--volumes-from", &backup_name,
-                "--network", "bridge",
-                &image,
-            ])
-            .output(),
-    ).await;
-
-    match run_output {
-        Ok(Ok(output)) if output.status.success() => {
-            let new_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-            // Remove old container
-            if let Err(e) = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                safe_command("docker")
-                    .args(["rm", "-f", &backup_name])
-                    .output(),
-            ).await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()))
-                .map(|_| ())
-            {
-                tracing::warn!("change_image: failed to remove old container {backup_name}: {e}");
-            }
-
-            tracing::info!("Image changed for {container_name}: → {image} (new: {new_id})");
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "container_id": new_id,
-                "image": image,
-            })))
-        }
-        _ => {
-            // Rollback: rename old container back and start it
-            if let Err(e) = safe_command("docker")
-                .args(["rename", &backup_name, &container_name])
-                .output().await
-            {
-                tracing::warn!("change_image rollback: failed to rename {backup_name} back to {container_name}: {e}");
-            }
-            if let Err(e) = tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                safe_command("docker")
-                    .args(["start", &container_name])
-                    .output(),
-            ).await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()))
-                .map(|_| ())
-            {
-                tracing::warn!("change_image rollback: failed to start {container_name}: {e}");
-            }
-
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Failed to create new container, rolled back to previous image"}))))
-        }
-    }
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "container_id": new_id,
+        "image": image,
+    })))
 }
 
 /// POST /apps/{container_id}/update-limits — Update CPU/memory limits on a running container.

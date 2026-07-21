@@ -383,6 +383,7 @@ export default function Apps() {
   const [images, setImages] = useState<{ repository: string; tag: string; id: string; size: string; created: string }[]>([]);
   const [imagesLoading, setImagesLoading] = useState(false);
   const [imagePruning, setImagePruning] = useState(false);
+  const [pruneArmed, setPruneArmed] = useState(false);
 
   // App tags state (Feature #7)
   const [appTags, setAppTags] = useState<Record<string, string>>(() => {
@@ -411,6 +412,7 @@ export default function Apps() {
   const [stacks, setStacks] = useState<StackInfo[]>([]);
   const [expandedStack, setExpandedStack] = useState<string | null>(null);
   const [stackActionLoading, setStackActionLoading] = useState<string | null>(null);
+  const [stackRemoveArmed, setStackRemoveArmed] = useState<string | null>(null);
 
   // Image vulnerability scan results — keyed by image ref. Hydrated once
   // alongside templates/apps; updated on per-app rescan.
@@ -1223,13 +1225,33 @@ volumes:
                         {stackActionLoading === `${stack.id}-restart` ? "..." : "Restart"}
                       </button>
                     )}
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleStackAction(stack.id, "remove"); }}
-                      disabled={stackActionLoading !== null}
-                      className="px-2 py-1 text-xs text-danger-400 hover:text-danger-300 disabled:opacity-50"
-                    >
-                      {stackActionLoading === `${stack.id}-remove` ? "..." : "Remove"}
-                    </button>
+                    {stackRemoveArmed === stack.id ? (
+                      <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setStackRemoveArmed(null); handleStackAction(stack.id, "remove"); }}
+                          disabled={stackActionLoading !== null}
+                          className="px-2 py-1 text-xs bg-danger-500 text-white rounded disabled:opacity-50"
+                          title="Removes every container in this stack"
+                        >
+                          {stackActionLoading === `${stack.id}-remove` ? "..." : "Confirm"}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setStackRemoveArmed(null); }}
+                          disabled={stackActionLoading !== null}
+                          className="px-2 py-1 text-xs bg-dark-600 text-dark-200 rounded disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setStackRemoveArmed(stack.id); }}
+                        disabled={stackActionLoading !== null}
+                        className="px-2 py-1 text-xs text-danger-400 hover:text-danger-300 disabled:opacity-50"
+                      >
+                        {stackActionLoading === `${stack.id}-remove` ? "..." : "Remove"}
+                      </button>
+                    )}
                     <svg className={`w-4 h-4 text-dark-400 transition-transform ${expandedStack === stack.id ? "rotate-180" : ""}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                       <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 8.25l-7.5 7.5-7.5-7.5" />
                     </svg>
@@ -2369,13 +2391,34 @@ volumes:
                 Docker Images
               </h3>
               <div className="flex items-center gap-2">
-                <button
-                  onClick={handlePruneImages}
-                  disabled={imagePruning}
-                  className="px-3 py-1.5 text-xs font-medium bg-warn-500/10 text-warn-400 rounded hover:bg-warn-500/20 disabled:opacity-50"
-                >
-                  {imagePruning ? "Pruning..." : "Prune Unused"}
-                </button>
+                {pruneArmed ? (
+                  <>
+                    <button
+                      onClick={() => { setPruneArmed(false); handlePruneImages(); }}
+                      disabled={imagePruning}
+                      className="px-3 py-1.5 text-xs font-medium bg-danger-500 text-white rounded disabled:opacity-50"
+                      title="Removes ALL unused images host-wide — irreversible"
+                    >
+                      {imagePruning ? "Pruning..." : "Confirm — prune all unused"}
+                    </button>
+                    <button
+                      onClick={() => setPruneArmed(false)}
+                      disabled={imagePruning}
+                      className="px-3 py-1.5 text-xs font-medium bg-dark-600 text-dark-200 rounded disabled:opacity-50"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={() => setPruneArmed(true)}
+                    disabled={imagePruning}
+                    className="px-3 py-1.5 text-xs font-medium bg-warn-500/10 text-warn-400 rounded hover:bg-warn-500/20 disabled:opacity-50"
+                    title="Removes ALL unused images host-wide — irreversible"
+                  >
+                    {imagePruning ? "Pruning..." : "Prune Unused"}
+                  </button>
+                )}
                 <button
                   onClick={loadImages}
                   className="px-3 py-1.5 text-xs font-medium bg-dark-700 text-dark-200 rounded hover:bg-dark-600"
@@ -2820,6 +2863,7 @@ function OllamaModels({ containerId, onClose }: { containerId: string; onClose: 
   const [deleting, setDeleting] = useState<string | null>(null);
   const [customModel, setCustomModel] = useState("");
   const [pullResult, setPullResult] = useState<{ type: string; msg: string }>({ type: "", msg: "" });
+  const [deleteArmed, setDeleteArmed] = useState<string | null>(null);
 
   const loadModels = () => {
     setLoading(true);
@@ -2851,10 +2895,15 @@ function OllamaModels({ containerId, onClose }: { containerId: string; onClose: 
 
   const deleteModel = async (name: string) => {
     setDeleting(name);
+    setPullResult({ type: "", msg: "" });
     try {
       await api.post(`/apps/${containerId}/ollama/delete`, { model: name });
+      setPullResult({ type: "success", msg: `Removed ${name}` });
       loadModels();
-    } catch { /* ignore */ }
+    } catch (e) {
+      // s237 audit: was `catch { /* ignore */ }` — a failed delete surfaced nothing.
+      setPullResult({ type: "error", msg: e instanceof Error ? e.message : "Failed to remove model" });
+    }
     finally { setDeleting(null); }
   };
 
@@ -2894,13 +2943,32 @@ function OllamaModels({ containerId, onClose }: { containerId: string; onClose: 
                       <p className="text-sm text-dark-50 font-mono">{m.name}</p>
                       <p className="text-xs text-dark-400">{m.size} {m.id ? `\u00b7 ${m.id.slice(0, 12)}` : ""}</p>
                     </div>
-                    <button
-                      onClick={() => deleteModel(m.name)}
-                      disabled={deleting === m.name}
-                      className="px-2 py-1 text-xs text-danger-400 hover:bg-danger-500/10 rounded disabled:opacity-50"
-                    >
-                      {deleting === m.name ? "..." : "Remove"}
-                    </button>
+                    {deleteArmed === m.name ? (
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => { setDeleteArmed(null); deleteModel(m.name); }}
+                          disabled={deleting === m.name}
+                          className="px-2 py-1 text-xs bg-danger-500 text-white rounded disabled:opacity-50"
+                        >
+                          {deleting === m.name ? "..." : "Confirm"}
+                        </button>
+                        <button
+                          onClick={() => setDeleteArmed(null)}
+                          disabled={deleting === m.name}
+                          className="px-2 py-1 text-xs bg-dark-600 text-dark-200 rounded disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setDeleteArmed(m.name)}
+                        disabled={deleting === m.name}
+                        className="px-2 py-1 text-xs text-danger-400 hover:bg-danger-500/10 rounded disabled:opacity-50"
+                      >
+                        {deleting === m.name ? "..." : "Remove"}
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
