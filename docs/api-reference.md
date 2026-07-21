@@ -478,6 +478,13 @@ Add a mail domain.
 | Backup | POST `/api/mail/backup`, GET `backups`, POST `restore` |
 | Reputation | GET `/api/mail/blacklist-check` |
 
+**Account passwords** are hashed with **Argon2id** and stored in Dovecot's
+`{ARGON2ID}` scheme (since v2.13.1). Accounts created before v2.13.1 were stored
+with a hash Dovecot could not verify — **reset each mailbox's password once**
+after upgrading so login works. Address fields (e-mail, alias source/destination,
+catch-all, forward-to) are validated against a strict character set and return
+`400` on invalid input.
+
 ---
 
 ## Servers (10 endpoints)

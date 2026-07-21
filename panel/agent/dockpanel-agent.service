@@ -35,7 +35,7 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictNamespaces=~user
-ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/letsencrypt /etc/apt /etc/fail2ban /etc/systemd/system /etc/powerdns /etc/modsecurity /etc/cloudflared /etc/postfix /etc/dovecot /var/spool/postfix /opt /var/cache/nginx /etc/ufw /var/lib/ufw
+ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/letsencrypt /etc/apt /etc/fail2ban /etc/systemd/system /etc/powerdns /etc/modsecurity /etc/cloudflared /etc/postfix /etc/dovecot /var/spool/postfix /var/vmail /opt /var/cache/nginx /etc/ufw /var/lib/ufw
 
 MemoryMax=512M
 LimitNOFILE=65535

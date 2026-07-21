@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.13.1] - 2026-07-21
+
+Mail-surface hardening — a security and correctness pass over the mail-server
+management surface (an s236 audit-coverage rotation). Fixes a defect that made
+mailbox login impossible, closes a path traversal and two world-readable
+secret-file issues, and removes several ways mail config could silently drift.
+
+### Fixed
+
+- **Mailbox login now works.** Mail-account passwords were hashed with a single
+  unsalted-round SHA-512 mislabeled `{SHA512-CRYPT}` — a value Dovecot's crypt(3)
+  verifier rejects for every password, so IMAP/POP3/SMTP-AUTH/webmail login had
+  never actually authenticated. Passwords are now hashed with **Argon2id** and
+  stored in Dovecot's `{ARGON2ID}` scheme (a real key-stretching KDF, verified
+  against Dovecot 2.3.21). **Existing mailboxes must have their password reset
+  once** to receive a working hash.
+- **Path traversal in mailbox restore.** `POST /api/mail/restore` built the
+  extraction directory from the request e-mail without rejecting `..` / `/`, so a
+  crafted address could redirect the `tar` extraction and a recursive `chown`
+  out of `/var/vmail` into agent-writable root-daemon config directories. Restore
+  now applies the same path validation the backup path already enforced.
+- **World-readable secret files.** The Dovecot users file (password hashes) and
+  mailbox-backup tarballs (plaintext mail) were written at the process umask
+  (0644). They are now **0600**, and the mailbox-backup directory **0700** —
+  parity with the DKIM key and SASL password files.
+
+### Changed / Hardened
+
+- Mail address fields (account e-mail, alias source/destination, catch-all,
+  forward-to) are validated at the API against the same character set the agent
+  enforces, so an out-of-charset value returns **400** instead of being stored
+  and then silently wedging every future Postfix/Dovecot sync.
+- Deleting or disabling a mail domain now rebuilds the Postfix/Dovecot maps
+  immediately, so a decommissioned domain's mailboxes stop authenticating and
+  receiving right away (previously they stayed live until an unrelated change).
+- `delete_alias` is scoped to its domain; mailbox quotas are clamped to a sane
+  range; Postfix `mynetworks_style` is pinned to `host` so `permit_mynetworks`
+  can't trust a shared subnet; and `tar` invocations use `--` before
+  user-derived operands. Added the mail surface's first unit tests.
+- Added `/var/vmail` to the (sandboxed) panel agent's `ReadWritePaths` so it can
+  create and own mailbox maildirs — previously blocked by `ProtectSystem=strict`,
+  so a fresh mailbox had no maildir until Dovecot lazily created one and couldn't
+  be backed up. Takes effect when the agent unit is redeployed by update/install.
+
+### Notes
+
+- Deferred (tracked in tech debt): the mail tables are global while writes go to
+  whichever server the active `X-Server-Id` selects — a multi-server split that
+  needs a pin-or-fan-out design decision; and the shared msmtp relay log is
+  world-writable (needs a per-pool / syslog restructure).
+
 ## [2.13.0] - 2026-07-20
 
 Phase 4 W5 — **fleet configuration-drift detection**. A read-only report that

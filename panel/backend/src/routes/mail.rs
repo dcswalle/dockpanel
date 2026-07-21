@@ -328,6 +328,7 @@ pub async fn create_domain(
 pub async fn update_domain(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateDomainRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -340,12 +341,8 @@ pub async fn update_domain(
     let domain = domain.ok_or_else(|| err(StatusCode::NOT_FOUND, "Domain not found"))?;
 
     if let Some(catch_all) = &body.catch_all {
-        if !catch_all.is_empty() {
-            if !catch_all.contains('@') || catch_all.len() > 254
-                || catch_all.contains('\n') || catch_all.contains('\r') || catch_all.contains('|') || catch_all.contains('\0')
-            {
-                return Err(err(StatusCode::BAD_REQUEST, "Invalid catch-all email address"));
-            }
+        if !catch_all.is_empty() && (!catch_all.contains('@') || !is_valid_mail_address(catch_all, "/")) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid catch-all email address"));
         }
         sqlx::query("UPDATE mail_domains SET catch_all = $1, updated_at = NOW() WHERE id = $2")
             .bind(if catch_all.is_empty() { None } else { Some(catch_all.as_str()) })
@@ -363,6 +360,10 @@ pub async fn update_domain(
             .await
             .map_err(|e| internal_error("update domain", e))?;
     }
+
+    // Push the catch_all/enabled change into Postfix/Dovecot — previously written to the DB only,
+    // so disabling a domain or setting a catch-all had no effect until an unrelated account change.
+    let _ = sync_mail_config(&state, &agent).await;
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email, "mail.domain.update",
@@ -408,6 +409,11 @@ pub async fn delete_domain(
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("delete domain", e))?;
+
+    // Rebuild Postfix/Dovecot maps from the remaining rows so the deleted domain's mailboxes
+    // stop authenticating and receiving immediately — the agent's /mail/domains/remove only drops
+    // the DKIM key and defers map cleanup to this sync, which delete_domain previously never called.
+    let _ = sync_mail_config(&state, &agent).await;
 
     // ── Auto-DNS cleanup: delete MX, A, SPF, DMARC, DKIM records ─────────
     let dns_domain = domain.0.clone();
@@ -539,18 +545,24 @@ pub async fn create_account(
     let domain = domain.ok_or_else(|| err(StatusCode::NOT_FOUND, "Domain not found"))?;
 
     let email = body.email.trim().to_lowercase();
-    if !email.contains('@') || !email.ends_with(&format!("@{}", domain.0)) {
+    if !email.ends_with(&format!("@{}", domain.0)) {
         return Err(err(StatusCode::BAD_REQUEST, &format!("Email must end with @{}", domain.0)));
+    }
+    if email.matches('@').count() != 1 || !is_valid_mail_address(&email, "") {
+        return Err(err(StatusCode::BAD_REQUEST, "Email address contains invalid characters"));
     }
 
     if body.password.len() < 8 {
         return Err(err(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
     }
 
-    // Hash password using Dovecot-compatible scheme (SHA512-CRYPT)
-    let password_hash = format!("{{SHA512-CRYPT}}{}", sha512_crypt(&body.password));
+    // Hash password with Argon2id in Dovecot's {ARGON2ID} scheme form.
+    let password_hash = dovecot_password_hash(&body.password)
+        .map_err(|e| internal_error("hash mail password", e))?;
 
-    let quota = body.quota_mb.unwrap_or(1024);
+    // Clamp quota to a sane range (1 MB .. 1 TB): 0/negative would write `storage=0M` / a garbage
+    // rule into the Dovecot userdb; an unbounded value silently removes the quota.
+    let quota = body.quota_mb.unwrap_or(1024).clamp(1, 1_048_576);
 
     let account: MailAccount = sqlx::query_as(
         "INSERT INTO mail_accounts (domain_id, email, password_hash, display_name, quota_mb) \
@@ -607,7 +619,8 @@ pub async fn update_account(
         if password.len() < 8 {
             return Err(err(StatusCode::BAD_REQUEST, "Password must be at least 8 characters"));
         }
-        let hash = format!("{{SHA512-CRYPT}}{}", sha512_crypt(password));
+        let hash = dovecot_password_hash(password)
+            .map_err(|e| internal_error("hash mail password", e))?;
         sqlx::query("UPDATE mail_accounts SET password_hash = $1, updated_at = NOW() WHERE id = $2")
             .bind(&hash)
             .bind(account_id)
@@ -626,8 +639,9 @@ pub async fn update_account(
     }
 
     if let Some(quota) = body.quota_mb {
+        // Clamp to a sane range (1 MB .. 1 TB) — 0/negative writes a broken Dovecot quota rule.
         sqlx::query("UPDATE mail_accounts SET quota_mb = $1, updated_at = NOW() WHERE id = $2")
-            .bind(quota)
+            .bind(quota.clamp(1, 1_048_576))
             .bind(account_id)
             .execute(&state.db)
             .await
@@ -644,12 +658,8 @@ pub async fn update_account(
     }
 
     if let Some(forward) = &body.forward_to {
-        if !forward.is_empty() {
-            if !forward.contains('@') || forward.len() > 254
-                || forward.contains('\n') || forward.contains('\r') || forward.contains('|') || forward.contains('\0')
-            {
-                return Err(err(StatusCode::BAD_REQUEST, "Invalid forwarding email address"));
-            }
+        if !forward.is_empty() && (!forward.contains('@') || !is_valid_mail_address(forward, "")) {
+            return Err(err(StatusCode::BAD_REQUEST, "Invalid forwarding email address"));
         }
         sqlx::query("UPDATE mail_accounts SET forward_to = $1, updated_at = NOW() WHERE id = $2")
             .bind(if forward.is_empty() { None } else { Some(forward.as_str()) })
@@ -758,13 +768,23 @@ pub async fn create_alias(
     Path(domain_id): Path<Uuid>,
     Json(body): Json<CreateAliasRequest>,
 ) -> Result<(StatusCode, Json<MailAlias>), ApiError> {
+    let source = body.source_email.trim().to_lowercase();
+    let destination = body.destination_email.trim().to_lowercase();
+    if source.matches('@').count() != 1 || !is_valid_mail_address(&source, "") {
+        return Err(err(StatusCode::BAD_REQUEST, "Alias source contains invalid characters"));
+    }
+    // Destination may be a comma-separated list of targets (matches the agent's alias validation).
+    if !destination.contains('@') || !is_valid_mail_address(&destination, ",") {
+        return Err(err(StatusCode::BAD_REQUEST, "Alias destination contains invalid characters"));
+    }
+
     let alias: MailAlias = sqlx::query_as(
         "INSERT INTO mail_aliases (domain_id, source_email, destination_email) \
          VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(domain_id)
-    .bind(body.source_email.trim().to_lowercase())
-    .bind(body.destination_email.trim().to_lowercase())
+    .bind(&source)
+    .bind(&destination)
     .fetch_one(&state.db)
     .await
     .map_err(|e| {
@@ -790,16 +810,25 @@ pub async fn delete_alias(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
-    Path((_domain_id, alias_id)): Path<(Uuid, Uuid)>,
+    Path((domain_id, alias_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let alias: Option<(String,)> = sqlx::query_as("SELECT source_email FROM mail_aliases WHERE id = $1")
+    // Scope the alias to the {domain_id} path segment — otherwise a mismatched (domain, alias)
+    // pair would delete an alias belonging to a different domain (matches delete_account/update_account).
+    let alias: Option<(String,)> = sqlx::query_as(
+        "SELECT source_email FROM mail_aliases WHERE id = $1 AND domain_id = $2",
+    )
         .bind(alias_id)
+        .bind(domain_id)
         .fetch_optional(&state.db)
         .await
         .map_err(|e| internal_error("delete alias", e))?;
+    if alias.is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "Alias not found"));
+    }
 
-    sqlx::query("DELETE FROM mail_aliases WHERE id = $1")
+    sqlx::query("DELETE FROM mail_aliases WHERE id = $1 AND domain_id = $2")
         .bind(alias_id)
+        .bind(domain_id)
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("delete alias", e))?;
@@ -1613,22 +1642,76 @@ async fn sync_mail_config(state: &AppState, agent: &AgentHandle) -> Result<(), S
     Ok(())
 }
 
-/// Generate SHA512-CRYPT password hash for Dovecot
-fn sha512_crypt(password: &str) -> String {
-    use sha2::{Sha512, Digest};
-    use rand::Rng;
-
-    let mut rng = rand::rng();
-    let salt: String = (0..16)
-        .map(|_| {
-            let idx = rng.random_range(0..64);
-            b"./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"[idx] as char
+/// Accept only the address character set the agent's `sync_config` accepts (ASCII alphanumeric
+/// plus `@ . _ - +`, and any char in `extra_allowed`). Anything outside it makes the agent reject
+/// the ENTIRE sync batch — and because callers discard the sync result, one bad row would silently
+/// freeze all future Postfix/Dovecot updates. Rejecting at the door (400) surfaces the error to the
+/// operator instead of wedging mail provisioning. (s236 mail-surface audit.)
+fn is_valid_mail_address(addr: &str, extra_allowed: &str) -> bool {
+    !addr.is_empty()
+        && addr.len() <= 255
+        && addr.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-' | '+') || extra_allowed.contains(c)
         })
-        .collect();
+}
 
-    // Simple SHA512 hash with salt (not full crypt, but compatible enough for Dovecot SSHA512)
-    let mut hasher = Sha512::new();
-    hasher.update(format!("{salt}{password}"));
-    let hash = hasher.finalize();
-    format!("$6${salt}${}", hex::encode(hash))
+/// Hash a mailbox password for Dovecot using Argon2id.
+///
+/// Returns the credential in Dovecot's `{ARGON2ID}` scheme form, e.g.
+/// `{ARGON2ID}$argon2id$v=19$m=...,t=...,p=...$salt$hash`, which Dovecot (>= 2.3.11) verifies
+/// natively and which is the same Argon2id KDF the panel uses for its own user accounts.
+///
+/// The previous implementation emitted a single unsalted-round `SHA512(salt || password)` hex
+/// digest labelled `{SHA512-CRYPT}`. That was neither a real crypt(3) SHA-512 hash — so
+/// Dovecot's SHA512-CRYPT verifier rejected it for *every* password, breaking all mailbox login
+/// (IMAP/POP/SMTP-AUTH/webmail) — nor an adequate password KDF. Confirmed live with `doveadm
+/// pw -t` during the s236 mail-surface audit; see the `dovecot_hash_*` tests below.
+fn dovecot_password_hash(password: &str) -> Result<String, argon2::password_hash::Error> {
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
+    use argon2::{Argon2, PasswordHasher};
+
+    let salt = SaltString::generate(&mut OsRng);
+    let phc = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)?
+        .to_string();
+    Ok(format!("{{ARGON2ID}}{phc}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dovecot_password_hash;
+    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::Argon2;
+
+    #[test]
+    fn dovecot_hash_is_argon2id_scheme_and_verifies() {
+        let pw = "correct horse battery staple";
+        let stored = dovecot_password_hash(pw).unwrap();
+
+        // Dovecot scheme label + PHC string (exactly what gets written to the dovecot users file).
+        assert!(
+            stored.starts_with("{ARGON2ID}$argon2id$"),
+            "expected an {{ARGON2ID}} PHC credential, got: {stored}"
+        );
+
+        // The PHC after the scheme label must verify against the password — the same check
+        // Dovecot's ARGON2ID scheme performs (confirmed live with `doveadm pw -t`, s236 audit).
+        let phc = stored.strip_prefix("{ARGON2ID}").unwrap();
+        let parsed = PasswordHash::new(phc).expect("credential is a valid PHC string");
+        assert!(
+            Argon2::default().verify_password(pw.as_bytes(), &parsed).is_ok(),
+            "correct password must verify"
+        );
+        assert!(
+            Argon2::default().verify_password(b"wrong password", &parsed).is_err(),
+            "wrong password must be rejected"
+        );
+    }
+
+    #[test]
+    fn dovecot_hash_uses_a_random_salt() {
+        let a = dovecot_password_hash("same-password").unwrap();
+        let b = dovecot_password_hash("same-password").unwrap();
+        assert_ne!(a, b, "each hash must use a fresh random salt");
+    }
 }

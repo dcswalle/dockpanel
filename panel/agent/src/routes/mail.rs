@@ -205,6 +205,9 @@ virtual_transport = lmtp:unix:private/dovecot-lmtp
 smtpd_sasl_type = dovecot
 smtpd_sasl_path = private/auth
 smtpd_sasl_auth_enable = yes
+# Trust only this host's own addresses (not the whole subnet) so permit_mynetworks can't let a
+# same-subnet neighbour relay unauthenticated on shared-network hosts.
+mynetworks_style = host
 smtpd_recipient_restrictions = permit_sasl_authenticated, permit_mynetworks, reject_unauth_destination
 
 # TLS
@@ -291,7 +294,8 @@ ssl = required
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_mailbox_maps: {e}")))?;
     write_file_atomic(POSTFIX_VIRTUAL_ALIAS, "").await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write virtual_alias_maps: {e}")))?;
-    write_file_atomic(DOVECOT_USERS, "").await
+    // 0600: the Dovecot users file holds password hashes — never world-readable.
+    write_file_atomic_mode(DOVECOT_USERS, "", 0o600).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot users: {e}")))?;
     let _ = safe_command("postmap").arg(POSTFIX_VIRTUAL_MAILBOX).output().await;
     let _ = safe_command("postmap").arg(POSTFIX_VIRTUAL_ALIAS).output().await;
@@ -630,7 +634,8 @@ async fn sync_config(
             format!("{}:{}::::{}::userdb_quota_rule=*:storage={}M", a.email, a.password_hash, maildir, a.quota_mb)
         })
         .collect();
-    write_file_atomic(DOVECOT_USERS, &dovecot_lines.join("\n")).await
+    // 0600: this file holds every mail account's password hash — never world-readable.
+    write_file_atomic_mode(DOVECOT_USERS, &dovecot_lines.join("\n"), 0o600).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot users: {e}")))?;
 
     // 5. Run postmap to rebuild hash tables
@@ -1306,13 +1311,20 @@ async fn mailbox_backup(Json(body): Json<MailboxBackupRequest>) -> Result<Json<s
 
     let backup_dir = "/var/lib/dockpanel/mail-backups";
     tokio::fs::create_dir_all(backup_dir).await.ok();
+    // The tarballs contain plaintext mail — keep the directory owner-only (0700).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(backup_dir, std::fs::Permissions::from_mode(0o700)).await;
+    }
 
     let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     let backup_file = format!("{backup_dir}/{user}_{domain}_{timestamp}.tar.gz");
 
+    // `--` ends option parsing so a local-part beginning with '-' can't be read as a tar flag.
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(300),
-        safe_command("tar").args(["czf", &backup_file, "-C", &format!("/var/vmail/{domain}"), user]).output()
+        safe_command("tar").args(["czf", &backup_file, "-C", &format!("/var/vmail/{domain}"), "--", user]).output()
     ).await
         .map_err(|_| err(StatusCode::GATEWAY_TIMEOUT, "Backup timed out"))?
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Backup failed: {e}")))?;
@@ -1320,6 +1332,13 @@ async fn mailbox_backup(Json(body): Json<MailboxBackupRequest>) -> Result<Json<s
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Backup failed: {stderr}")));
+    }
+
+    // 0600: the archive is a full copy of the mailbox's plaintext mail — never world-readable.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = tokio::fs::set_permissions(&backup_file, std::fs::Permissions::from_mode(0o600)).await;
     }
 
     // Get file size
@@ -1342,7 +1361,16 @@ async fn mailbox_restore(Json(body): Json<serde_json::Value>) -> Result<Json<ser
     if !Path::new(backup_file).exists() { return Err(err(StatusCode::NOT_FOUND, "Backup file not found")); }
 
     let parts: Vec<&str> = email.splitn(2, '@').collect();
+    if parts.len() != 2 { return Err(err(StatusCode::BAD_REQUEST, "Invalid email format")); }
     let (user, domain) = (parts[0], parts[1]);
+    // Reject path traversal in the email — otherwise `maildir` below could escape /var/vmail into
+    // an agent-writable root-daemon config dir (the tar `-C` target + the recursive chown). This
+    // mirrors the guard the sibling mailbox_backup already applies.
+    if user.is_empty() || domain.is_empty()
+        || user.contains('/') || user.contains('\\') || user.contains("..")
+        || domain.contains('/') || domain.contains('\\') || domain.contains("..") {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid email format"));
+    }
     let maildir = format!("/var/vmail/{domain}");
 
     // Restore
@@ -1459,6 +1487,24 @@ async fn tls_enforce(Json(body): Json<serde_json::Value>) -> Result<Json<serde_j
 async fn write_file_atomic(path: &str, content: &str) -> Result<(), String> {
     let tmp_path = format!("{path}.tmp");
     tokio::fs::write(&tmp_path, content).await.map_err(|e| e.to_string())?;
+    tokio::fs::rename(&tmp_path, path).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Like `write_file_atomic` but sets `mode` on the temp file before it is renamed into place,
+/// so a secret file (e.g. the Dovecot users file, which holds mail-account password hashes) is
+/// never even briefly world-readable. Without this, `write_file_atomic` leaves the file at the
+/// process umask (0644 under root's default 022) — the s236 mail-audit finding.
+async fn write_file_atomic_mode(path: &str, content: &str, mode: u32) -> Result<(), String> {
+    let tmp_path = format!("{path}.tmp");
+    tokio::fs::write(&tmp_path, content).await.map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     tokio::fs::rename(&tmp_path, path).await.map_err(|e| e.to_string())?;
     Ok(())
 }
