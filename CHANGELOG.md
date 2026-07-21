@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.15.0] - 2026-07-21
+
+Docker Apps hardening, round two — closing the meatier findings deferred from the
+v2.14.0 audit-coverage rotation. All four fixes tighten the admin-only Docker
+app-management surface: they refuse where they previously silently allowed, gate a
+footgun endpoint, and remove a security control that was displayed but never
+enforced.
+
+### Security
+
+- **Container action handlers now verify the target is a DockPanel-managed
+  container.** `stop` / `start` / `restart` / `logs` / `exec` / `remove` /
+  `change-image` / `update` / `env` / `snapshot` / `update-limits` and the Ollama
+  model endpoints previously validated only the container-ID *format*, so a
+  well-formed id for the panel's own infrastructure (its PostgreSQL / API / agent
+  containers) would be acted on. Each handler now inspects the container and
+  refuses (403) unless it carries the `dockpanel.managed=true` label — the same
+  boundary the app *list* already enforced, closing a severed read/write scope.
+- **`activity-ping` is now admin-only.** The endpoint that resets a container's
+  auto-sleep idle timer accepted any authenticated user, so a non-admin could keep
+  an arbitrary container awake and defeat auto-sleep. It now requires an admin, in
+  line with the sibling wake/sleep handlers. (Its documented "nginx keepalive"
+  purpose was never reachable — an nginx reverse proxy cannot present a user JWT —
+  so no legitimate caller is affected.)
+
+### Changed
+
+- **Removed the `network_isolation` container-policy control.** The per-user policy
+  toggle was persisted and displayed but read by nothing at deploy time — a
+  security-labelled control that did nothing, giving false confidence. It has been
+  removed from the API and the Container Policies UI. (The dormant database column
+  is left in place; no migration.) Real per-user network segmentation, if wanted,
+  is tracked as future work.
+
+### Fixed
+
+- **Per-user container quota now fails closed.** When the container-count check
+  could not reach the agent (or received a malformed response), deploy previously
+  proceeded and silently bypassed the user's `max_containers` limit. A count-check
+  failure now refuses the deploy (502) instead of allowing over-quota.
+
 ## [2.14.0] - 2026-07-21
 
 Docker Apps hardening — a security, correctness, and safety pass over the Docker

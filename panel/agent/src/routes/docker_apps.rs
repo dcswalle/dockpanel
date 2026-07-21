@@ -44,6 +44,18 @@ struct DeployRequest {
     gpu_indices: Option<Vec<u32>>,
 }
 
+/// Reject the request unless `container_id` names a dockpanel-managed container. WRITE-scope parity
+/// with the `list` READ path (which filters on `dockpanel.managed=true`): prevents an admin from
+/// acting on the panel's OWN infrastructure containers (postgres/api/agent) by id. Returns 403.
+async fn ensure_managed(container_id: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    docker_apps::require_managed(container_id).await.map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Not a dockpanel-managed container" })),
+        )
+    })
+}
+
 /// GET /apps/templates — List all available app templates.
 async fn templates() -> Json<Vec<docker_apps::AppTemplate>> {
     Json(docker_apps::list_templates())
@@ -281,6 +293,7 @@ async fn stop(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     docker_apps::stop_app(&container_id)
         .await
@@ -304,6 +317,7 @@ async fn start(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     docker_apps::start_app(&container_id)
         .await
@@ -327,6 +341,7 @@ async fn restart(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     docker_apps::restart_app(&container_id)
         .await
@@ -350,6 +365,7 @@ async fn logs(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     let output = docker_apps::get_app_logs(&container_id, 200)
         .await
@@ -374,6 +390,7 @@ async fn update(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     let result = docker_apps::update_app(&container_id)
         .await
@@ -401,6 +418,7 @@ async fn get_env(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     let env = docker_apps::get_app_env(&container_id)
         .await
@@ -451,6 +469,7 @@ async fn update_env(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     let new_id = docker_apps::update_env(&container_id, body.env)
         .await
@@ -474,6 +493,7 @@ async fn container_stats(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     // Use docker stats --no-stream for a single snapshot
     let output = tokio::time::timeout(
@@ -513,6 +533,7 @@ async fn shell_info(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     let name_output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -566,6 +587,7 @@ async fn exec_command(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
     let command = body
         .get("command")
         .and_then(|v| v.as_str())
@@ -633,6 +655,7 @@ async fn container_volumes(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -826,6 +849,7 @@ async fn remove(
             Json(serde_json::json!({ "error": "Invalid container ID" })),
         ));
     }
+    ensure_managed(&container_id).await?;
 
     // Extract app metadata before removing the container
     let domain = docker_apps::get_app_domain(&container_id).await;
@@ -1160,6 +1184,7 @@ async fn snapshot_container(
     if !is_valid_container_id(&container_id) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid container ID" }))));
     }
+    ensure_managed(&container_id).await?;
 
     let tag = {
         let raw = body.tag.unwrap_or_else(|| {
@@ -1226,6 +1251,7 @@ async fn change_image(
     if !is_valid_container_id(&container_id) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid container ID"}))));
     }
+    ensure_managed(&container_id).await?;
 
     let image = body.get("image").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
     if image.is_empty() {
@@ -1255,6 +1281,7 @@ async fn update_container_limits(
     if !is_valid_container_id(&container_id) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid container ID"}))));
     }
+    ensure_managed(&container_id).await?;
 
     let memory_mb = body.get("memory_mb").and_then(|v| v.as_u64());
     let cpu_percent = body.get("cpu_percent").and_then(|v| v.as_u64());
@@ -1356,6 +1383,7 @@ async fn ollama_list_models(
     if !is_valid_container_id(&container_id) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid container ID" }))));
     }
+    ensure_managed(&container_id).await?;
 
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(15),
@@ -1399,6 +1427,7 @@ async fn ollama_pull_model(
     if !is_valid_container_id(&container_id) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid container ID" }))));
     }
+    ensure_managed(&container_id).await?;
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("").trim();
     if model.is_empty() || model.len() > 200 {
@@ -1439,6 +1468,7 @@ async fn ollama_delete_model(
     if !is_valid_container_id(&container_id) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Invalid container ID" }))));
     }
+    ensure_managed(&container_id).await?;
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("").trim();
     if model.is_empty() || model.len() > 200 {

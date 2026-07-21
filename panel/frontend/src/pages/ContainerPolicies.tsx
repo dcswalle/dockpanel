@@ -10,7 +10,6 @@ interface Policy {
   max_containers: number;
   max_memory_mb: number;
   max_cpu_percent: number;
-  network_isolation: boolean;
   allowed_images: string | null;
   created_at: string;
   updated_at: string;
@@ -36,7 +35,6 @@ export default function ContainerPolicies() {
   const [maxContainers, setMaxContainers] = useState(10);
   const [maxMemory, setMaxMemory] = useState(4096);
   const [maxCpu, setMaxCpu] = useState(400);
-  const [netIsolation, setNetIsolation] = useState(false);
   const [allowedImages, setAllowedImages] = useState("");
   const [saving, setSaving] = useState(false);
 
@@ -71,7 +69,6 @@ export default function ContainerPolicies() {
     setMaxContainers(10);
     setMaxMemory(4096);
     setMaxCpu(400);
-    setNetIsolation(false);
     setAllowedImages("");
     setShowForm(false);
   };
@@ -82,7 +79,6 @@ export default function ContainerPolicies() {
     setMaxContainers(p.max_containers);
     setMaxMemory(p.max_memory_mb);
     setMaxCpu(p.max_cpu_percent);
-    setNetIsolation(p.network_isolation);
     setAllowedImages(p.allowed_images || "");
     setShowForm(true);
   };
@@ -96,7 +92,6 @@ export default function ContainerPolicies() {
           max_containers: maxContainers,
           max_memory_mb: maxMemory,
           max_cpu_percent: maxCpu,
-          network_isolation: netIsolation,
           allowed_images: allowedImages || null,
         });
         setMessage({ text: "Policy updated", type: "success" });
@@ -106,7 +101,6 @@ export default function ContainerPolicies() {
           max_containers: maxContainers,
           max_memory_mb: maxMemory,
           max_cpu_percent: maxCpu,
-          network_isolation: netIsolation,
           allowed_images: allowedImages || null,
         });
         setMessage({ text: "Policy created", type: "success" });
@@ -137,8 +131,8 @@ export default function ContainerPolicies() {
     <div className="max-w-5xl mx-auto space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-xl font-bold text-dark-50">Container Isolation Policies</h1>
-          <p className="text-sm text-dark-300 mt-1">Manage per-user container limits, quotas, and network isolation</p>
+          <h1 className="text-xl font-bold text-dark-50">Container Policies</h1>
+          <p className="text-sm text-dark-300 mt-1">Manage per-user container limits and resource quotas</p>
         </div>
         <button
           onClick={() => { resetForm(); setShowForm(true); }}
@@ -212,20 +206,6 @@ export default function ContainerPolicies() {
                 <p className="text-xs text-dark-400 mt-1">100% = 1 CPU core. 400% = 4 cores.</p>
               </div>
 
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-sm text-dark-100">Network Isolation</p>
-                  <p className="text-xs text-dark-400">Isolate user's containers in a separate Docker network</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setNetIsolation(!netIsolation)}
-                  className={`relative w-11 h-6 rounded-full transition-colors ${netIsolation ? "bg-rust-500" : "bg-dark-600"}`}
-                >
-                  <span className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform ${netIsolation ? "translate-x-5" : ""}`} />
-                </button>
-              </div>
-
               <div>
                 <label className="block text-sm text-dark-200 mb-1">Allowed Images (comma-separated, optional)</label>
                 <input
@@ -263,15 +243,14 @@ export default function ContainerPolicies() {
               <th className="text-center px-4 py-3 text-xs font-medium text-dark-300 uppercase">Containers</th>
               <th className="text-center px-4 py-3 text-xs font-medium text-dark-300 uppercase">Memory</th>
               <th className="text-center px-4 py-3 text-xs font-medium text-dark-300 uppercase">CPU</th>
-              <th className="text-center px-4 py-3 text-xs font-medium text-dark-300 uppercase">Network</th>
               <th className="text-right px-4 py-3 text-xs font-medium text-dark-300 uppercase">Actions</th>
             </tr>
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={6} className="text-center py-8 text-dark-400">Loading...</td></tr>
+              <tr><td colSpan={5} className="text-center py-8 text-dark-400">Loading...</td></tr>
             ) : policies.length === 0 ? (
-              <tr><td colSpan={6} className="text-center py-8 text-dark-400">No policies configured. Users have unlimited container access by default.</td></tr>
+              <tr><td colSpan={5} className="text-center py-8 text-dark-400">No policies configured. Users have unlimited container access by default.</td></tr>
             ) : (
               policies.map(p => (
                 <tr key={p.id} className="border-b border-dark-700 hover:bg-dark-700/30">
@@ -282,13 +261,6 @@ export default function ContainerPolicies() {
                   <td className="text-center px-4 py-3 text-dark-200">{p.max_containers}</td>
                   <td className="text-center px-4 py-3 text-dark-200">{p.max_memory_mb >= 1024 ? `${(p.max_memory_mb / 1024).toFixed(1)}GB` : `${p.max_memory_mb}MB`}</td>
                   <td className="text-center px-4 py-3 text-dark-200">{p.max_cpu_percent}%</td>
-                  <td className="text-center px-4 py-3">
-                    {p.network_isolation ? (
-                      <span className="inline-flex px-2 py-0.5 rounded text-xs bg-rust-500/20 text-rust-400">Isolated</span>
-                    ) : (
-                      <span className="text-dark-400 text-xs">Shared</span>
-                    )}
-                  </td>
                   <td className="text-right px-4 py-3">
                     <button onClick={() => openEdit(p)} className="text-xs text-accent-400 hover:text-accent-300 mr-3">Edit</button>
                     <button onClick={() => handleDelete(p.user_id)} className="text-xs text-danger-400 hover:text-danger-300">Remove</button>
@@ -306,7 +278,6 @@ export default function ContainerPolicies() {
         <div className="space-y-2 text-sm text-dark-200">
           <p><strong className="text-dark-100">Container limits</strong> — Maximum number of Docker containers a user can deploy.</p>
           <p><strong className="text-dark-100">Memory &amp; CPU</strong> — Maximum resources per container deployment.</p>
-          <p><strong className="text-dark-100">Network isolation</strong> — Each user's containers run in a separate Docker network, preventing cross-user container communication.</p>
           <p><strong className="text-dark-100">Allowed images</strong> — Restrict which Docker images a user can deploy. Leave empty for no restriction.</p>
           <p className="text-xs text-dark-400 mt-2">Users without a policy have no container limits applied.</p>
         </div>

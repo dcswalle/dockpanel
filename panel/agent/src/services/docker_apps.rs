@@ -3387,6 +3387,35 @@ pub async fn get_app_name(container_id: &str) -> Option<String> {
     info.config?.labels?.get("dockpanel.app.name").cloned()
 }
 
+/// True iff the container's labels mark it dockpanel-managed (`dockpanel.managed=true`).
+/// This is the boundary that separates panel-managed app containers from the panel's OWN infra
+/// (its postgres/api/agent containers carry no such label). Pure + unit-tested.
+fn is_managed_labels(labels: Option<&HashMap<String, String>>) -> bool {
+    labels
+        .and_then(|l| l.get("dockpanel.managed"))
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+/// Guard an action-handler target: inspect the container and reject unless it is dockpanel-managed.
+/// Gives WRITE scope (stop/start/restart/logs/exec/remove/change-image/update/env/snapshot/limits)
+/// the same `dockpanel.managed=true` boundary the `list` READ path already enforces, so an admin
+/// cannot act on the panel's own infrastructure containers by id (confused-deputy footgun). For the
+/// recreate paths (change_container_image/update_env) this runs on the ORIGINAL container before any
+/// stop/remove, and the recreation preserves the label — so the new container stays managed.
+pub async fn require_managed(container_id: &str) -> Result<(), String> {
+    let docker =
+        Docker::connect_with_local_defaults().map_err(|e| format!("Docker connect failed: {e}"))?;
+    let info = docker
+        .inspect_container(container_id, None)
+        .await
+        .map_err(|e| format!("Failed to inspect container: {e}"))?;
+    if !is_managed_labels(info.config.as_ref().and_then(|c| c.labels.as_ref())) {
+        return Err("not a dockpanel-managed container".to_string());
+    }
+    Ok(())
+}
+
 /// Update a container's environment variables by recreating it with the new env.
 pub async fn update_env(
     container_id: &str,
@@ -3493,4 +3522,26 @@ pub async fn remove_app(container_id: &str) -> Result<(), String> {
 
     tracing::info!("App container removed: {container_id}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_label_gate() {
+        // Only dockpanel.managed=true passes; panel infra (no such label) and false are rejected.
+        let managed = HashMap::from([("dockpanel.managed".to_string(), "true".to_string())]);
+        assert!(is_managed_labels(Some(&managed)));
+
+        let disabled = HashMap::from([("dockpanel.managed".to_string(), "false".to_string())]);
+        assert!(!is_managed_labels(Some(&disabled)));
+
+        // A panel-infra container (e.g. only compose labels) must be rejected.
+        let infra = HashMap::from([("com.docker.compose.project".to_string(), "dockpanel".to_string())]);
+        assert!(!is_managed_labels(Some(&infra)));
+
+        assert!(!is_managed_labels(Some(&HashMap::new())));
+        assert!(!is_managed_labels(None));
+    }
 }
