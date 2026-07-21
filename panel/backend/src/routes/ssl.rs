@@ -256,8 +256,13 @@ pub async fn provision_dns01(
 
     let cf_zone_id = zone.cf_zone_id.as_deref()
         .ok_or_else(|| err(StatusCode::PRECONDITION_FAILED, "Zone has no Cloudflare zone ID"))?;
-    let cf_api_token = zone.cf_api_token.as_deref()
+    let cf_api_token_enc = zone.cf_api_token.as_deref()
         .ok_or_else(|| err(StatusCode::PRECONDITION_FAILED, "Zone has no Cloudflare API token"))?;
+    // Decrypt the at-rest token before handing it to the agent for the DNS-01 challenge —
+    // this consumer serialises the token into the agent request body, not via cf_headers.
+    let cf_api_token = crate::services::secrets_crypto::decrypt_credential_or_legacy(
+        cf_api_token_enc, &state.config.jwt_secret,
+    );
 
     // Get admin email for ACME
     let (email,): (String,) = sqlx::query_as("SELECT email FROM users WHERE id = $1")

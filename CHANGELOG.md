@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [2.16.0] - 2026-07-21
+
+DNS-surface security hardening — the audit-coverage rotation's fresh-eyes pass over the
+DNS management surface (`routes/dns.rs`, the DNS page, the agent PowerDNS installer, and
+the DNS-01 SSL path), which had never had a behavioral security audit. The headline fix
+closes a cross-tenant DNS-takeover hole; the rest tighten credential handling, fail-closed
+behaviour, and input validation.
+
+### Security
+
+- **DNS management is now admin-only.** The zone/record write endpoints (`create`/`delete`
+  zone, `create`/`update`/`delete` record) and the zone/record listings were reachable by
+  any authenticated user, while every read/analytics endpoint already required admin. A
+  non-admin could create and fully control zones and records on the panel's shared
+  authoritative PowerDNS server for domains they did not own — traffic redirection, MX
+  interception, or a planted `_acme-challenge` TXT to fraudulently pass an ACME DNS-01
+  challenge. Every DNS and tunnel handler now calls `require_admin`, and the DNS page is
+  gated in the navigation.
+- **Cloudflare API tokens are encrypted at rest.** Zone tokens were stored in plaintext in
+  `dns_zones.cf_api_token` while the PowerDNS key was already encrypted. Tokens are now
+  encrypted with the shared credential cipher on write and decrypted transparently at the
+  single Cloudflare-header choke point (existing plaintext rows keep working via the legacy
+  fallback — no migration required).
+- **Cloudflare Tunnel token no longer world-readable.** The agent wrote the tunnel token
+  into a 0644 systemd unit and onto the `cloudflared` command line. It now lives in a
+  root-only (0600) `EnvironmentFile` and is passed via `TUNNEL_TOKEN`, never on the
+  command line.
+- **DNS-01 challenge TXT records are always cleaned up.** Four early-return error paths in
+  the wildcard-certificate flow could leave `_acme-challenge` TXT records dangling in
+  Cloudflare (a sub-domain-takeover surface); cleanup now runs on every exit.
+- **`delete_zone` fails closed.** A PowerDNS zone-deletion error (or unreadable settings)
+  previously still removed the panel's tracking row, orphaning an authoritative zone; the
+  DB row is now dropped only after the authoritative zone is confirmed gone.
+- **`dig`-based propagation / health checks reject option injection.** The DNS-name and
+  domain validators now reject a leading `-`/`+` (covered by a new unit test), so a crafted
+  value can never be parsed by `dig` as an option.
+- **PowerDNS API error bodies are no longer reflected to the client** — they are logged
+  server-side and a generic message is returned.
+- **Input validation at the door** — `create_zone` now validates the domain and the
+  Cloudflare Zone ID before use.
+
+### Fixed
+
+- The DNS change-log endpoint now surfaces a database error instead of silently returning
+  an empty history.
+- The "Purge Entire Cache" action now asks for confirmation before purging.
+- Zone list-load failures are shown as an error instead of the empty "add a zone" state.
+- Zone templates no longer write the operator's browser IP (via `api.ipify.org`) as the
+  domain's A record.
+- The Cloudflare Tunnel configuration comment no longer claims to store a token hash, and
+  the settings write is no longer silently discarded.
+
 ## [2.15.0] - 2026-07-21
 
 Docker Apps hardening, round two — closing the meatier findings deferred from the
