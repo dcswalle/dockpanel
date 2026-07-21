@@ -142,8 +142,9 @@ export default function Dns() {
       if (data.length > 0 && !selectedZone) {
         selectZone(data[0]);
       }
-    } catch {
-      // no zones yet
+    } catch (e) {
+      // Surface the failure instead of silently showing the empty "add a zone" state.
+      setMessage({ text: e instanceof Error ? e.message : "Failed to load DNS zones", type: "error" });
     } finally {
       setLoading(false);
     }
@@ -307,6 +308,8 @@ export default function Dns() {
       setSelectedRecords(new Set());
       setBulkDeleting(false);
       selectZone(selectedZone);
+    } else if (type === "purge-everything") {
+      purgeCfCache();
     }
   };
 
@@ -386,8 +389,10 @@ export default function Dns() {
   const applyTemplate = async (template: string) => {
     if (!selectedZone) return;
     const domain = selectedZone.domain;
-    let serverIp = '';
-    try { const resp = await fetch('https://api.ipify.org'); serverIp = await resp.text(); } catch {}
+    // Do NOT derive the A-record target from the admin's browser: api.ipify.org returns
+    // the operator's client/VPN IP, not the server's. Use a clear placeholder the
+    // operator must replace with the real server IP.
+    const serverIp = '';
 
     const templates: Record<string, Record<string, unknown>[]> = {
       website: [
@@ -1283,7 +1288,7 @@ export default function Dns() {
                     <div className="flex items-center gap-3">
                       <button
                         disabled={cfCachePurging}
-                        onClick={() => purgeCfCache()}
+                        onClick={() => setPendingConfirm({ type: "purge-everything", data: null, label: "Purge the ENTIRE Cloudflare cache for this zone?" })}
                         className="px-3 py-1.5 bg-amber-500/10 text-amber-400 rounded-lg text-xs font-medium hover:bg-amber-500/20 disabled:opacity-50 transition-colors"
                       >
                         {cfCachePurging ? "Purging..." : "Purge Entire Cache"}

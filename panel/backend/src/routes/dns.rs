@@ -59,13 +59,15 @@ pub struct UpdateRecordRequest {
     pub priority: Option<u16>,
 }
 
-/// Helper: get zone and verify ownership.
-async fn get_zone(state: &AppState, zone_id: Uuid, user_id: Uuid) -> Result<DnsZone, ApiError> {
+/// Helper: load a zone by id. DNS management is admin-only (every handler calls
+/// `require_admin`), so any admin may manage any zone — we no longer scope by
+/// `user_id` (that scoping made the admin-gated read endpoints unusable on a zone
+/// created by a different admin).
+async fn get_zone(state: &AppState, zone_id: Uuid) -> Result<DnsZone, ApiError> {
     sqlx::query_as::<_, DnsZone>(
-        "SELECT * FROM dns_zones WHERE id = $1 AND user_id = $2",
+        "SELECT * FROM dns_zones WHERE id = $1",
     )
     .bind(zone_id)
-    .bind(user_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|e| internal_error("unknown", e))?
@@ -151,6 +153,18 @@ fn strip_dot(name: &str) -> String {
     name.trim_end_matches('.').to_string()
 }
 
+/// A DNS name/domain is safe to pass as a POSITIONAL `dig` argument only if dig cannot
+/// parse it as an option: non-empty, no leading '-'/'+', and a conservative charset.
+/// `allow_underscore` covers query names like `_dmarc` / `_acme-challenge`.
+fn is_safe_dig_arg(s: &str, allow_underscore: bool) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.starts_with('+')
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '.' || c == '-' || (allow_underscore && c == '_')
+        })
+}
+
 /// Create a synthetic record ID for PowerDNS records (name|type|content).
 fn pdns_record_id(name: &str, rtype: &str, content: &str) -> String {
     // URL-safe: hex-encode the composite key
@@ -223,10 +237,10 @@ pub async fn list_zones(
     State(state): State<AppState>,
     AuthUser(claims): AuthUser,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    require_admin(&claims.role)?;
     let zones: Vec<DnsZone> = sqlx::query_as(
-        "SELECT * FROM dns_zones WHERE user_id = $1 ORDER BY domain LIMIT 500",
+        "SELECT * FROM dns_zones ORDER BY domain LIMIT 500",
     )
-    .bind(claims.sub)
     .fetch_all(&state.db)
     .await
     .map_err(|e| internal_error("list zones", e))?;
@@ -253,10 +267,15 @@ pub async fn create_zone(
     AuthUser(claims): AuthUser,
     Json(body): Json<CreateZoneRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    require_admin(&claims.role)?;
     let provider = body.provider.as_deref().unwrap_or("cloudflare");
 
-    if body.domain.trim().is_empty() {
+    let domain = body.domain.trim();
+    if domain.is_empty() {
         return Err(err(StatusCode::BAD_REQUEST, "Domain is required"));
+    }
+    if !crate::routes::is_valid_domain(domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain name"));
     }
 
     match provider {
@@ -265,6 +284,11 @@ pub async fn create_zone(
             let cf_api_token = body.cf_api_token.as_deref().unwrap_or("").trim();
             if cf_zone_id.is_empty() || cf_api_token.is_empty() {
                 return Err(err(StatusCode::BAD_REQUEST, "Cloudflare Zone ID and API token are required"));
+            }
+            // CF zone IDs are 32-char lowercase hex; validate to keep untrusted input
+            // out of the Cloudflare API URL path.
+            if cf_zone_id.len() != 32 || !cf_zone_id.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(err(StatusCode::BAD_REQUEST, "Invalid Cloudflare Zone ID"));
             }
 
             // Validate CF credentials
@@ -289,14 +313,19 @@ pub async fn create_zone(
                 ));
             }
 
+            // Encrypt the Cloudflare API token at rest (mirrors the pdns_api_key /
+            // smtp_password pattern). Read paths decrypt via `helpers::cf_headers`.
+            let cf_token_enc = crate::services::secrets_crypto::encrypt_credential(
+                cf_api_token, &state.config.jwt_secret,
+            ).map_err(|e| internal_error("encrypt cf token", e))?;
             let zone: DnsZone = sqlx::query_as(
                 "INSERT INTO dns_zones (user_id, domain, provider, cf_zone_id, cf_api_token, cf_api_email) \
                  VALUES ($1, $2, 'cloudflare', $3, $4, $5) RETURNING *",
             )
             .bind(claims.sub)
-            .bind(body.domain.trim())
+            .bind(domain)
             .bind(cf_zone_id)
-            .bind(cf_api_token)
+            .bind(&cf_token_enc)
             .bind(body.cf_api_email.as_deref().map(|s| s.trim()))
             .fetch_one(&state.db)
             .await
@@ -325,7 +354,7 @@ pub async fn create_zone(
         "powerdns" => {
             let (pdns_url, pdns_key) = pdns_settings(&state).await?;
             let (client, headers) = pdns_client(&pdns_key)?;
-            let zone_fqdn = fqdn(body.domain.trim());
+            let zone_fqdn = fqdn(domain);
 
             // Create zone in PowerDNS
             let pdns_body = serde_json::json!({
@@ -348,7 +377,8 @@ pub async fn create_zone(
                 let body_text = resp.text().await.unwrap_or_default();
                 // 409 = zone already exists in PowerDNS, we can still track it
                 if status.as_u16() != 409 {
-                    return Err(err(StatusCode::BAD_GATEWAY, &format!("PowerDNS error: {body_text}")));
+                    tracing::warn!("PowerDNS error (create zone): {body_text}");
+                    return Err(err(StatusCode::BAD_GATEWAY, "PowerDNS request failed"));
                 }
             }
 
@@ -357,7 +387,7 @@ pub async fn create_zone(
                  VALUES ($1, $2, 'powerdns') RETURNING *",
             )
             .bind(claims.sub)
-            .bind(body.domain.trim())
+            .bind(domain)
             .fetch_one(&state.db)
             .await
             .map_err(|e| {
@@ -391,18 +421,28 @@ pub async fn delete_zone(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
-    // If PowerDNS, also delete the zone from PowerDNS server
+    // If PowerDNS, delete the zone from the authoritative server FIRST and fail closed:
+    // only drop our tracking row once the zone is actually gone, so a transient PowerDNS
+    // error can't orphan an authoritative zone (panel says deleted, server still answers).
     if zone.provider == "powerdns" {
-        if let Ok((pdns_url, pdns_key)) = pdns_settings(&state).await {
-            let (client, headers) = pdns_client(&pdns_key)?;
-            let zone_fqdn = fqdn(&zone.domain);
-            let _ = client
-                .delete(&format!("{pdns_url}/api/v1/servers/localhost/zones/{zone_fqdn}"))
-                .headers(headers)
-                .send()
-                .await;
+        let (pdns_url, pdns_key) = pdns_settings(&state).await?;
+        let (client, headers) = pdns_client(&pdns_key)?;
+        let zone_fqdn = fqdn(&zone.domain);
+        let resp = client
+            .delete(&format!("{pdns_url}/api/v1/servers/localhost/zones/{zone_fqdn}"))
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| agent_error("PowerDNS delete zone", e))?;
+        let st = resp.status();
+        // 2xx = deleted; 404 = already absent — both are acceptable end states.
+        if !st.is_success() && st.as_u16() != 404 {
+            let body_text = resp.text().await.unwrap_or_default();
+            tracing::warn!("PowerDNS delete-zone error ({}): {body_text}", zone.domain);
+            return Err(err(StatusCode::BAD_GATEWAY, "PowerDNS request failed; zone not deleted"));
         }
     }
 
@@ -423,7 +463,8 @@ pub async fn list_records(
     AuthUser(claims): AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     match zone.provider.as_str() {
         "cloudflare" => {
@@ -470,7 +511,8 @@ pub async fn list_records(
 
             if !resp.status().is_success() {
                 let body = resp.text().await.unwrap_or_default();
-                return Err(err(StatusCode::BAD_GATEWAY, &format!("PowerDNS error: {body}")));
+                tracing::warn!("PowerDNS error (list records): {body}");
+                return Err(err(StatusCode::BAD_GATEWAY, "PowerDNS request failed"));
             }
 
             let pdns_resp: serde_json::Value = resp
@@ -498,7 +540,8 @@ pub async fn create_record(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateRecordRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     let allowed_types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"];
     if !allowed_types.contains(&body.rtype.as_str()) {
@@ -624,7 +667,8 @@ pub async fn create_record(
 
             if !resp.status().is_success() {
                 let body_text = resp.text().await.unwrap_or_default();
-                return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &format!("PowerDNS error: {body_text}")));
+                tracing::warn!("PowerDNS record error: {body_text}");
+                return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "PowerDNS rejected the record"));
             }
 
             activity::log_activity(
@@ -651,7 +695,8 @@ pub async fn update_record(
     Path((id, record_id)): Path<(Uuid, String)>,
     Json(body): Json<UpdateRecordRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     if record_id.is_empty() || record_id.len() > 256 {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid record ID"));
@@ -844,7 +889,8 @@ pub async fn update_record(
 
             if !resp.status().is_success() {
                 let body_text = resp.text().await.unwrap_or_default();
-                return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &format!("PowerDNS error: {body_text}")));
+                tracing::warn!("PowerDNS record error: {body_text}");
+                return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "PowerDNS rejected the record"));
             }
 
             activity::log_activity(
@@ -870,7 +916,8 @@ pub async fn delete_record(
     AuthUser(claims): AuthUser,
     Path((id, record_id)): Path<(Uuid, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let zone = get_zone(&state, id, claims.sub).await?;
+    require_admin(&claims.role)?;
+    let zone = get_zone(&state, id).await?;
 
     if record_id.is_empty() || record_id.len() > 256 {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid record ID"));
@@ -966,7 +1013,8 @@ pub async fn delete_record(
 
             if !resp.status().is_success() {
                 let body_text = resp.text().await.unwrap_or_default();
-                return Err(err(StatusCode::UNPROCESSABLE_ENTITY, &format!("PowerDNS error: {body_text}")));
+                tracing::warn!("PowerDNS record error: {body_text}");
+                return Err(err(StatusCode::UNPROCESSABLE_ENTITY, "PowerDNS rejected the record"));
             }
 
             activity::log_activity(
@@ -997,11 +1045,9 @@ pub async fn check_propagation(
         .and_then(|v| v.as_str())
         .unwrap_or("A");
 
-    // Validate inputs to prevent command injection
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-    {
+    // Reject anything dig could parse as an option (leading -/+) or that escapes the
+    // conservative DNS charset. See is_safe_dig_arg + its unit test.
+    if !is_safe_dig_arg(name, true) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid DNS name"));
     }
     let valid_types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA"];
@@ -1084,13 +1130,8 @@ pub async fn dns_health_check(
         .and_then(|v| v.as_str())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "domain required"))?;
 
-    // Validate domain
-    if domain.is_empty()
-        || domain.len() > 253
-        || !domain
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
+    // Reject anything dig could parse as an option, or that escapes the DNS charset.
+    if domain.len() > 253 || !is_safe_dig_arg(domain, false) {
         return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
     }
 
@@ -1174,7 +1215,7 @@ pub async fn dnssec_status(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let zone = get_zone(&state, id, claims.sub).await?;
+    let zone = get_zone(&state, id).await?;
 
     if zone.provider != "cloudflare" {
         return Ok(Json(serde_json::json!({
@@ -1225,7 +1266,7 @@ pub async fn dns_changelog(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let zone = get_zone(&state, id, claims.sub).await?;
+    let zone = get_zone(&state, id).await?;
 
     let entries: Vec<(String, String, Option<String>, chrono::DateTime<chrono::Utc>)> =
         sqlx::query_as(
@@ -1235,7 +1276,7 @@ pub async fn dns_changelog(
         .bind(&zone.domain)
         .fetch_all(&state.db)
         .await
-        .unwrap_or_default();
+        .map_err(|e| internal_error("dns changelog", e))?;
 
     let logs: Vec<serde_json::Value> = entries
         .iter()
@@ -1261,7 +1302,7 @@ pub async fn dns_analytics(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let zone = get_zone(&state, id, claims.sub).await?;
+    let zone = get_zone(&state, id).await?;
 
     if zone.provider != "cloudflare" {
         return Ok(Json(serde_json::json!({
@@ -1360,7 +1401,7 @@ pub async fn cf_zone_settings(
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let zone = get_zone(&state, id, claims.sub).await?;
+    let zone = get_zone(&state, id).await?;
 
     if zone.provider != "cloudflare" {
         return Ok(Json(serde_json::json!({
@@ -1411,7 +1452,7 @@ pub async fn cf_update_setting(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let zone = get_zone(&state, id, claims.sub).await?;
+    let zone = get_zone(&state, id).await?;
 
     if zone.provider != "cloudflare" {
         return Err(err(StatusCode::BAD_REQUEST, "Only available for Cloudflare zones"));
@@ -1517,7 +1558,7 @@ pub async fn cf_purge_cache(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin(&claims.role)?;
-    let zone = get_zone(&state, id, claims.sub).await?;
+    let zone = get_zone(&state, id).await?;
 
     if zone.provider != "cloudflare" {
         return Err(err(StatusCode::BAD_REQUEST, "Cache purge only available for Cloudflare zones"));
@@ -1594,13 +1635,17 @@ pub async fn configure_tunnel(
         .await
         .map_err(|e| agent_error("Tunnel configure", e))?;
 
-    // Store token hash in settings (for display purposes, not the actual token)
-    let _ = sqlx::query(
+    // Mark the tunnel as configured — a boolean display flag only. The tunnel token
+    // itself lives exclusively on the agent (in a 0600 EnvironmentFile), never in the DB.
+    if let Err(e) = sqlx::query(
         "INSERT INTO settings (key, value) VALUES ('tunnel_configured', 'true') \
          ON CONFLICT (key) DO UPDATE SET value = 'true'"
     )
     .execute(&state.db)
-    .await;
+    .await
+    {
+        tracing::warn!("failed to persist tunnel_configured flag: {e}");
+    }
 
     activity::log_activity(
         &state.db, claims.sub, &claims.email,
@@ -1624,4 +1669,29 @@ pub async fn tunnel_status(
         .map_err(|e| agent_error("Tunnel status", e))?;
 
     Ok(Json(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_dig_arg;
+
+    #[test]
+    fn dig_arg_rejects_option_injection() {
+        // A leading dash/plus would let dig parse the value as an option (e.g. -f<file>).
+        assert!(!is_safe_dig_arg("-fFILE", true));
+        assert!(!is_safe_dig_arg("+short", true));
+        assert!(!is_safe_dig_arg("-x", false));
+        assert!(!is_safe_dig_arg("", true));
+        // Escaping the charset (spaces, slashes, shell metachars) is rejected.
+        assert!(!is_safe_dig_arg("a b", true));
+        assert!(!is_safe_dig_arg("a/b", true));
+        assert!(!is_safe_dig_arg("a;b", true));
+        // Underscore only where allowed (query names vs health-check domains).
+        assert!(is_safe_dig_arg("_dmarc.example.com", true));
+        assert!(!is_safe_dig_arg("_dmarc.example.com", false));
+        // Normal names pass.
+        assert!(is_safe_dig_arg("example.com", true));
+        assert!(is_safe_dig_arg("sub.example.com", false));
+        assert!(is_safe_dig_arg("mail-1.example.com", false));
+    }
 }

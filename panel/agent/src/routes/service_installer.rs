@@ -1310,7 +1310,31 @@ async fn configure_cloudflared(
 
     std::fs::create_dir_all("/etc/cloudflared").ok();
 
-    // Write systemd service that uses the token
+    // Write the tunnel token to a root-only (0600) EnvironmentFile so it is NOT
+    // world-readable in the unit file and NOT exposed on the process command line
+    // (cloudflared reads TUNNEL_TOKEN from the environment for `tunnel run`).
+    let token_env_path = "/etc/cloudflared/token.env";
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(token_env_path)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Write token file: {e}")))?;
+        f.write_all(format!("TUNNEL_TOKEN={token}\n").as_bytes())
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Write token file: {e}")))?;
+    }
+    // Harden perms even if the file already existed with a looser mode.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(token_env_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Write systemd service. The token is supplied via the 0600 EnvironmentFile
+    // (TUNNEL_TOKEN), never on the ExecStart command line.
     let service = format!(
         "[Unit]\n\
          Description=Cloudflare Tunnel\n\
@@ -1318,7 +1342,8 @@ async fn configure_cloudflared(
          Wants=network-online.target\n\n\
          [Service]\n\
          Type=simple\n\
-         ExecStart=/usr/bin/cloudflared tunnel run --token {token}\n\
+         EnvironmentFile={token_env_path}\n\
+         ExecStart=/usr/bin/cloudflared tunnel run\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          LimitNOFILE=65536\n\n\

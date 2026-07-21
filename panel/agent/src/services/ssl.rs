@@ -325,7 +325,13 @@ pub async fn provision_cert_dns01(
     if matches!(state.status, OrderStatus::Pending) {
         let mut authorizations = order.authorizations();
         while let Some(result) = authorizations.next().await {
-            let mut authz = result.map_err(|e| format!("Authorization: {e}"))?;
+            let mut authz = match result {
+                Ok(a) => a,
+                Err(e) => {
+                    cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
+                    return Err(format!("Authorization: {e}"));
+                }
+            };
 
             match authz.status {
                 AuthorizationStatus::Valid => continue,
@@ -336,11 +342,15 @@ pub async fn provision_cert_dns01(
                 }
             }
 
-            let mut challenge = authz
-                .challenge(ChallengeType::Dns01)
-                .ok_or_else(|| {
-                    "No DNS-01 challenge (Let's Encrypt may require HTTP-01 for this domain)".to_string()
-                })?;
+            let mut challenge = match authz.challenge(ChallengeType::Dns01) {
+                Some(c) => c,
+                None => {
+                    cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
+                    return Err(
+                        "No DNS-01 challenge (Let's Encrypt may require HTTP-01 for this domain)".to_string(),
+                    );
+                }
+            };
 
             let key_auth = challenge.key_authorization();
             let txt_value = key_auth.dns_value();
@@ -349,7 +359,7 @@ pub async fn provision_cert_dns01(
             let record_name = format!("_acme-challenge.{domain}");
             tracing::info!("DNS-01: creating TXT {record_name} = {txt_value}");
 
-            let resp = client
+            let resp = match client
                 .post(&format!("{cf_api}/zones/{cf_zone_id}/dns_records"))
                 .headers(headers.clone())
                 .json(&serde_json::json!({
@@ -360,10 +370,21 @@ pub async fn provision_cert_dns01(
                 }))
                 .send()
                 .await
-                .map_err(|e| format!("CF create TXT: {e}"))?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
+                    return Err(format!("CF create TXT: {e}"));
+                }
+            };
 
-            let resp_json: serde_json::Value = resp.json().await
-                .map_err(|e| format!("CF parse: {e}"))?;
+            let resp_json: serde_json::Value = match resp.json().await {
+                Ok(j) => j,
+                Err(e) => {
+                    cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;
+                    return Err(format!("CF parse: {e}"));
+                }
+            };
 
             if resp_json.get("success").and_then(|v| v.as_bool()) != Some(true) {
                 cleanup_cf_records(&client, cf_api, cf_zone_id, &headers, &created_records).await;

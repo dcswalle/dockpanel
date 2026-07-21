@@ -13,6 +13,13 @@ pub fn hash_agent_token(token: &str) -> String {
 /// If `email` is provided, uses Global API Key auth (X-Auth-Email + X-Auth-Key).
 /// Otherwise, uses Bearer token auth.
 pub fn cf_headers(token: &str, email: Option<&str>) -> reqwest::header::HeaderMap {
+    // The stored Cloudflare token / global API key is encrypted at rest (see
+    // dns::create_zone). Decrypt here — the single choke point every CF caller funnels
+    // through — so no read site can forget to. The legacy fallback returns any
+    // pre-encryption plaintext value (and a freshly-entered token during validation)
+    // unchanged, so the round trip is transparent.
+    let token = crate::services::secrets_crypto::decrypt_credential_from_env(token);
+    let token = token.as_str();
     let mut headers = reqwest::header::HeaderMap::new();
     if let Some(em) = email {
         if let (Ok(e_val), Ok(k_val)) = (em.parse(), token.parse()) {
